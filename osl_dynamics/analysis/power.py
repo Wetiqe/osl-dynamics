@@ -226,6 +226,9 @@ def save(
     plot_kwargs : dict
         Keyword arguments to pass to nilearn.plotting.plot_img_on_surf.
     """
+    # Create a copy of the power map so we don't modify it
+    power_map = np.copy(power_map)
+
     # Validation
     if ".nii.gz" not in filename and ".png" not in filename:
         raise ValueError("filename must have extension .nii.gz or .png.")
@@ -238,8 +241,9 @@ def save(
     if power_map.ndim > 1:
         if power_map.shape[-1] == power_map.shape[-2]:
             # A n_channels by n_channels array has been passed,
-            # extract the diagonal
-            power_map = np.diagonal(power_map, axis1=-2, axis2=-1)
+            # extract the diagonal (the np.copy is needed because np.diagonal
+            # returns a read-only array (this started in NumPy 1.9))
+            power_map = np.copy(np.diagonal(power_map, axis1=-2, axis2=-1))
     else:
         power_map = power_map[np.newaxis, ...]
 
@@ -331,6 +335,10 @@ def multi_save(
     plot_kwargs : dict
         Keyword arguments to pass to nilearn.plotting.plot_img_on_surf.
     """
+    # Create a copy of the power maps so we don't modify them
+    group_power_map = np.copy(group_power_map)
+    subject_power_map = np.copy(subject_power_map)
+
     # Validation
     if group_power_map.ndim > 1:
         if group_power_map.shape[-1] == group_power_map.shape[-2]:
