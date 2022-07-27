@@ -7,7 +7,7 @@ from sklearn.linear_model import LinearRegression
 from osl_dynamics.data.processing import standardize
 
 
-def linear(X, y, fit_intercept, normalize=False):
+def linear(X, y, fit_intercept, normalize=False, print_message=True):
     """Wrapper for sklearn's LinearRegression.
 
     Parameters
@@ -21,6 +21,8 @@ def linear(X, y, fit_intercept, normalize=False):
         Should we fit an intercept?
     normalize : bool
         Should we z-transform the regressors?
+    print_message : bool
+        Should we print a message?
 
     Returns
     -------
@@ -30,6 +32,8 @@ def linear(X, y, fit_intercept, normalize=False):
         1D or higher dimension array. Regression intercept.
         Returned if fit_intercept=True.
     """
+    if print_message:
+        print("Fitting linear regression")
 
     # Reshape in case non 2D matrices were passed
     original_shape = y.shape
@@ -40,14 +44,38 @@ def linear(X, y, fit_intercept, normalize=False):
     if normalize:
         X = standardize(X)
 
-    # Fit linear regression
-    reg = LinearRegression(fit_intercept=fit_intercept, n_jobs=-1)
-    reg.fit(X, y)
+    if y.dtype == np.complex64 or y.dtype == np.complex_:
+        # Fit two linear regressions:
+        # One for the real part
+        reg = LinearRegression(fit_intercept=fit_intercept, n_jobs=-1)
+        reg.fit(X, y.real)
+        coefs_real = reg.coef_.T.reshape(new_shape)
+        if fit_intercept:
+            intercept_real = reg.intercept_.reshape(new_shape[1:])
 
-    # Return regression coefficients and intercept
-    coefs = reg.coef_.T.reshape(new_shape)
+        # Another for the imaginary part
+        reg = LinearRegression(fit_intercept=fit_intercept, n_jobs=-1)
+        reg.fit(X, y.imag)
+        coefs_imag = reg.coef_.T.reshape(new_shape)
+        if fit_intercept:
+            intercept_imag = reg.intercept_.reshape(new_shape[1:])
+
+        # Regression parameters
+        coefs = coefs_real + 1j * coefs_imag
+        if fit_intercept:
+            intercept = intercept_real + 1j * intercept_imag
+
+    else:
+        # Only need to fit one linear regression
+        reg = LinearRegression(fit_intercept=fit_intercept, n_jobs=-1)
+        reg.fit(X, y)
+
+        # Regression parameters
+        coefs = reg.coef_.T.reshape(new_shape)
+        if fit_intercept:
+            intercept = reg.intercept_.reshape(new_shape[1:])
+
     if fit_intercept:
-        intercept = reg.intercept_.reshape(new_shape[1:])
         return coefs, intercept
     else:
         return coefs

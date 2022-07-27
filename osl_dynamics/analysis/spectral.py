@@ -256,7 +256,7 @@ def mar_spectra(coeffs, covs, sampling_frequency, n_f=512):
     f = np.arange(0, sampling_frequency / 2, sampling_frequency / (2 * n_f))
 
     # z-transform of the coefficients
-    A = np.zeros([n_f, n_modes, n_channels, n_channels], dtype=np.complex_)
+    A = np.zeros([n_f, n_modes, n_channels, n_channels], dtype=np.complex64)
     for i in range(n_f):
         for l in range(n_lags):
             z = np.exp(-1j * (l + 1) * 2 * np.pi * f[i] / sampling_frequency)
@@ -407,7 +407,7 @@ def multitaper(
     n_f = X.shape[-1]
 
     # Calculate the periodogram with each taper
-    P = np.zeros([n_channels, n_channels, n_f], dtype=np.complex_)
+    P = np.zeros([n_channels, n_channels, n_f], dtype=np.complex64)
     for i in range(n_tapers):
         for j in range(n_channels):
             for k in range(j, n_channels):
@@ -556,7 +556,7 @@ def multitaper_spectra(
         n_segments = round(n_samples / segment_length)
 
         # Power spectra for each mode
-        p = np.zeros([n_modes, n_channels, n_channels, n_f], dtype=np.complex_)
+        p = np.zeros([n_modes, n_channels, n_channels, n_f], dtype=np.complex64)
         for i in range(n_modes):
             for j in trange(n_segments, desc=f"Mode {i}", ncols=98):
 
@@ -703,9 +703,8 @@ def regression_spectra(
     # Remove the data points lost due to separating into sequences
     data = [d[: a.shape[0]] for d, a in zip(data, alpha)]
 
-    # Calculate a time-varying PSD
-    Pt = []
-    at = []
+    # Calculate a time-varying PSD and regress to get the mode PSDs
+    Pj = []
     for i in range(n_subjects):
         if n_subjects > 1:
             print(f"Subject {i}:")
@@ -724,61 +723,56 @@ def regression_spectra(
             step_size=step_size,
             n_sub_windows=n_sub_windows,
         )
-        Pt.append(p)
-        at.append(a)
-
-    # Regress the time-varying PSD with alpha to get the mode PSDs
-    Pj = []
-    for i in trange(n_subjects, desc="Fitting linear regression", ncols=98):
-        Pt[i] = abs(Pt[i])  # sklearn LinearRegression doesn't accept complex numbers
-        coefs, intercept = regression.linear(
-            at[i], Pt[i], fit_intercept=True, normalize=True
-        )
-        if return_coef_int:
-            Pj.append([coefs, intercept])
-        else:
-            Pj.append([coefs + intercept[np.newaxis, ...]])
-    Pj = np.array(Pj, dtype=object)
+        coefs, intercept = regression.linear(a, p, fit_intercept=True, normalize=True)
+        Pj.append([coefs, [intercept] * coefs.shape[0]])
+    Pj = np.array(Pj)
 
     # Weights for calculating the group average PSD
     n_samples = [d.shape[0] for d in data]
     weights = np.array(n_samples) / np.sum(n_samples)
 
     if psd_only:
+        if not return_coef_int:
+            # Sum coefficients and intercept
+            Pj = np.sum(Pj, axis=1)
+
         if return_weights:
             return f, np.squeeze(Pj), weights
         else:
             return f, np.squeeze(Pj)
 
-    # Number of parcels and freqency bins
-    n_parcels = data[0].shape[1]
+    # Number of channels and freqency bins
+    n_channels = data[0].shape[1]
     n_modes = alpha[0].shape[1]
-    n_f = Pj[0][0].shape[-1]
+    n_f = Pj.shape[-1]
 
-    # Indices of the upper triangle of an n_parcels by n_parcels array
-    m, n = np.triu_indices(n_parcels)
+    # Indices of the upper triangle of an n_channels by n_channels array
+    m, n = np.triu_indices(n_channels)
 
-    # Create a n_parcels by n_parcels array
-    P = []
+    # Create a n_channels by n_channels array
+    P = np.empty(
+        [n_subjects, 2, n_modes, n_channels, n_channels, n_f], dtype=np.complex64
+    )
     for i in range(n_subjects):
-        P.append([])
-        for j in range(len(Pj[i])):
-            p = np.empty([n_modes, n_parcels, n_parcels, n_f])
-            p[:, m, n] = Pj[i][j]
-            p[:, n, m] = Pj[i][j]
-            P[i].append(p)
-    P = np.array(P)
+        for j in range(2):  # j=0 is the coefficients and j=1 is the intercepts
+            P[i, j][:, m, n] = Pj[i, j]
+            P[i, j][:, n, m] = np.conj(Pj[i, j])
 
     # PSDs and coherences for each mode
-    psd = []
-    coh = []
+    psd = np.empty([n_subjects, 2, n_modes, n_channels, n_f], dtype=np.float32)
+    coh = np.empty([n_subjects, n_modes, n_channels, n_channels, n_f], dtype=np.float32)
     for i in range(n_subjects):
-        p = P[i, :, :, range(n_parcels), range(n_parcels)]
-        p = np.rollaxis(p, 0, 3)
-        c = np.sum(P[i], axis=0)  # sum coefs and intercept
-        c = coherence_spectra(c, print_message=False)
-        psd.append(p)
-        coh.append(c)
+        # PSDs
+        p = P[i, :, :, range(n_channels), range(n_channels)].real
+        psd[i] = np.rollaxis(p, axis=0, start=3)
+
+        # Coherences
+        p = np.sum(P[i], axis=0)  # sum coefs and intercept
+        coh[i] = coherence_spectra(p, print_message=False)
+
+    if not return_coef_int:
+        # Sum coefficients and intercept
+        psd = np.sum(psd, axis=1)
 
     if return_weights:
         return f, np.squeeze(psd), np.squeeze(coh), weights
@@ -863,10 +857,10 @@ def spectrogram(
     if calc_cpsd:
         # Calculate cross periodograms for each segment of the data
         P = np.empty(
-            [n_psds, n_channels * (n_channels + 1) // 2, n_f], dtype=np.complex_
+            [n_psds, n_channels * (n_channels + 1) // 2, n_f], dtype=np.complex64
         )
         XY_sub_window = np.empty(
-            [n_sub_windows, n_channels * (n_channels + 1) // 2, n_f], dtype=np.complex_
+            [n_sub_windows, n_channels * (n_channels + 1) // 2, n_f], dtype=np.complex64
         )
         for i in trange(n_psds, desc="Calculating spectrogram", ncols=98):
 

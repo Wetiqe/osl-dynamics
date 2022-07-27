@@ -10,12 +10,13 @@ import tensorflow as tf
 from tensorflow.keras import layers
 from tqdm import trange
 
-from osl_dynamics.models import mdynemo_obs
+from osl_dynamics.models import dynemo_obs, mdynemo_obs
 from osl_dynamics.models.mod_base import BaseModelConfig
 from osl_dynamics.models.inf_mod_base import (
     VariationalInferenceModelConfig,
     VariationalInferenceModelBase,
 )
+from osl_dynamics.inference import regularizers
 from osl_dynamics.inference.layers import (
     InferenceRNNLayer,
     LogLikelihoodLossLayer,
@@ -89,16 +90,22 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
 
     learn_means : bool
         Should we make the mean for each mode trainable?
-    learn_stds: bool
+    learn_stds : bool
         Should we make the standard deviation for each mode trainable?
-    learn_fcs: bool
+    learn_fcs : bool
         Should we make the functional connectivity for each mode trainable?
     initial_means : np.ndarray
         Initialisation for the mode means.
-    initial_stds: np.ndarray
+    initial_stds : np.ndarray
         Initialisation for mode standard deviations.
-    initial_fcs: np.ndarray
+    initial_fcs : np.ndarray
         Initialisation for mode functional connectivity matrices.
+    means_regularizer : tf.keras.regularizers.Regularizer
+        Regularizer for the mean vectors.
+    stds_regularizer : tf.keras.regularizers.Regularizer
+        Regularizer for the standard deviation vectors.
+    fcs_regularizer : tf.keras.regularizers.Regularizer
+        Regularizer for the correlation matrices.
 
     do_kl_annealing : bool
         Should we use KL annealing during training?
@@ -150,6 +157,9 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
     initial_means: np.ndarray = None
     initial_stds: np.ndarray = None
     initial_fcs: np.ndarray = None
+    means_regularizer: tf.keras.regularizers.Regularizer = None
+    stds_regularizer: tf.keras.regularizers.Regularizer = None
+    fcs_regularizer: tf.keras.regularizers.Regularizer = None
     multiple_dynamics: bool = True
 
     def __post_init__(self):
@@ -219,6 +229,28 @@ class Model(VariationalInferenceModelBase):
             the model?
         """
         mdynemo_obs.set_means_stds_fcs(self.model, means, stds, fcs, update_initializer)
+
+    def set_regularizers(self, training_dataset):
+        """Set the regularizers of means, stds and fcs based on the training data.
+
+        A multivariate normal prior is applied to the mean vectors with mu=0,
+        sigma=diag((range / 2)**2), a log normal prior is applied to the standard
+        deviations with mu=0, sigma=sqrt(log(2 * (range))) and a marginal inverse
+        Wishart prior is applied to the fcs matrices with nu = n_channels - 1 + 0.1.
+
+        Parameters
+        ----------
+        training_dataset : tensorflow.data.Dataset
+            Training dataset.
+        """
+        if self.config.learn_means:
+            dynemo_obs.set_means_regularizer(self.model, training_dataset)
+
+        if self.config.learn_stds:
+            mdynemo_obs.set_stds_regularizer(self.model, training_dataset)
+
+        if self.config.learn_fcs:
+            mdynemo_obs.set_fcs_regularizer(self.model, training_dataset)
 
     def sample_time_courses(self, n_samples: int):
         """Uses the model RNN to sample mode mixing factors, alpha and gamma.
@@ -393,6 +425,7 @@ def _model_structure(config):
         config.n_channels,
         config.learn_means,
         config.initial_means,
+        config.means_regularizer,
         name="means",
     )
     stds_layer = DiagonalMatricesLayer(
@@ -400,6 +433,7 @@ def _model_structure(config):
         config.n_channels,
         config.learn_stds,
         config.initial_stds,
+        config.stds_regularizer,
         name="stds",
     )
     fcs_layer = CorrelationMatricesLayer(
@@ -407,6 +441,7 @@ def _model_structure(config):
         config.n_channels,
         config.learn_fcs,
         config.initial_fcs,
+        config.fcs_regularizer,
         name="fcs",
     )
     mix_means_layer = MixVectorsLayer(name="mix_means")

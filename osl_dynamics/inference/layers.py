@@ -262,6 +262,8 @@ class MeanVectorsLayer(layers.Layer):
         Should we learn the vectors?
     initial_value : np.ndarray
         Initial value for the vectors.
+    regularizer : tf.keras.regularizers.Regularizer
+        Regularizer for vectors.
     """
 
     def __init__(
@@ -270,14 +272,19 @@ class MeanVectorsLayer(layers.Layer):
         m,
         learn,
         initial_value,
+        regularizer=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.n = n
         self.m = m
         self.learn = learn
+
+        # Initialisation for vectors
         if initial_value is None:
-            self.initial_value = np.zeros([n, m], dtype=np.float32)
+            self.initial_value = np.random.normal(0, 0.5, size=[n, m]).astype(
+                np.float32
+            )
         else:
             if initial_value.ndim != 2:
                 raise ValueError(
@@ -290,11 +297,14 @@ class MeanVectorsLayer(layers.Layer):
                 )
             if initial_value.shape[0] != n:
                 raise ValueError(
-                    f"mismatch bettwen the number of modes and vectors in "
+                    "mismatch bettwen the number of modes and vectors in "
                     + f"initial_means ({initial_value.shape[0]})."
                 )
             self.initial_value = initial_value.astype("float32")
         self.vectors_initializer = WeightInitializer(self.initial_value)
+
+        # Regulariser
+        self.regularizer = regularizer
 
     def build(self, input_shape):
         self.vectors = self.add_weight(
@@ -307,6 +317,17 @@ class MeanVectorsLayer(layers.Layer):
         self.built = True
 
     def call(self, inputs, **kwargs):
+        if self.regularizer is not None:
+            reg = self.regularizer(self.vectors)
+
+            # Calculate the scaling on regularisation
+            batch_size = tf.cast(tf.shape(inputs)[0], tf.float32)
+            n_batches = self.regularizer.n_batches
+            scaling_factor = batch_size * n_batches
+            reg = reg / scaling_factor
+
+            self.add_loss(reg)
+            self.add_metric(reg, name=self.name)
         return self.vectors
 
 
@@ -327,6 +348,8 @@ class CovarianceMatricesLayer(layers.Layer):
         Should the matrices be learnable?
     initial_value : np.ndarray
         Initial values for the matrices.
+    regularizer : tf.keras.regularizers.Regularizer
+        Regularizer for matrices.
     """
 
     def __init__(
@@ -335,6 +358,7 @@ class CovarianceMatricesLayer(layers.Layer):
         m,
         learn,
         initial_value,
+        regularizer=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -347,7 +371,10 @@ class CovarianceMatricesLayer(layers.Layer):
 
         # Initialisation of matrices
         if initial_value is None:
-            self.initial_value = np.stack([np.eye(m, dtype=np.float32)] * n)
+            self.initial_value = np.array(
+                [np.diag(np.random.normal(1, 0.05, size=m)) for i in range(n)],
+                dtype=np.float32,
+            )
         else:
             if initial_value.ndim != 3:
                 raise ValueError(
@@ -362,7 +389,7 @@ class CovarianceMatricesLayer(layers.Layer):
                 )
             if initial_value.shape[0] != n:
                 raise ValueError(
-                    f"mismatch bettwen the number of modes and matrices in "
+                    "mismatch bettwen the number of modes and matrices in "
                     + f"initial_covariances ({initial_value.shape[0]})."
                 )
             self.initial_value = initial_value.astype("float32")
@@ -372,6 +399,9 @@ class CovarianceMatricesLayer(layers.Layer):
         self.flattened_cholesky_factors_initializer = WeightInitializer(
             self.initial_flattened_cholesky_factors
         )
+
+        # Regulariser
+        self.regularizer = regularizer
 
     def build(self, input_shape):
         self.flattened_cholesky_factors = self.add_weight(
@@ -384,7 +414,19 @@ class CovarianceMatricesLayer(layers.Layer):
         self.built = True
 
     def call(self, inputs, **kwargs):
-        return self.bijector(self.flattened_cholesky_factors)
+        covariances = self.bijector(self.flattened_cholesky_factors)
+        if self.regularizer is not None:
+            reg = self.regularizer(covariances)
+
+            # Calculate the the scaling on regularisation
+            batch_size = tf.cast(tf.shape(inputs)[0], tf.float32)
+            n_batches = self.regularizer.n_batches
+            scaling_factor = batch_size * n_batches
+            reg = reg / scaling_factor
+
+            self.add_loss(reg)
+            self.add_metric(reg, name=self.name)
+        return covariances
 
 
 class CorrelationMatricesLayer(layers.Layer):
@@ -403,6 +445,8 @@ class CorrelationMatricesLayer(layers.Layer):
         Should the matrices be learnable?
     initial_value : np.ndarray
         Initial values for the matrices.
+    regularizer : tf.keras.regularizers.Regularizer
+        Regularizer for matrices.
     """
 
     def __init__(
@@ -411,6 +455,7 @@ class CorrelationMatricesLayer(layers.Layer):
         m,
         learn,
         initial_value,
+        regularizer=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -426,6 +471,13 @@ class CorrelationMatricesLayer(layers.Layer):
         # Initialisation of matrices
         if initial_value is None:
             self.initial_value = np.stack([np.eye(m, dtype=np.float32)] * n)
+            self.initial_flattened_cholesky_factors = self.bijector.inverse(
+                self.initial_value
+            )
+            err = np.random.normal(
+                0, 0.05, size=self.initial_flattened_cholesky_factors.shape
+            )
+            self.initial_flattened_cholesky_factors += err
         else:
             if initial_value.ndim != 3:
                 raise ValueError(
@@ -440,16 +492,19 @@ class CorrelationMatricesLayer(layers.Layer):
                 )
             if initial_value.shape[0] != n:
                 raise ValueError(
-                    f"mismatch bettwen the number of modes and matrices in "
+                    "mismatch bettwen the number of modes and matrices in "
                     + f"initial_fcs ({initial_value.shape[0]})."
                 )
             self.initial_value = initial_value.astype("float32")
-        self.initial_flattened_cholesky_factors = self.bijector.inverse(
-            self.initial_value
-        )
+            self.initial_flattened_cholesky_factors = self.bijector.inverse(
+                self.initial_value
+            )
         self.flattened_cholesky_factors_initializer = WeightInitializer(
             self.initial_flattened_cholesky_factors
         )
+
+        # Regulariser
+        self.regularizer = regularizer
 
     def build(self, input_shape):
         self.flattened_cholesky_factors = self.add_weight(
@@ -462,7 +517,19 @@ class CorrelationMatricesLayer(layers.Layer):
         self.built = True
 
     def call(self, inputs, **kwargs):
-        return self.bijector(self.flattened_cholesky_factors)
+        correlations = self.bijector(self.flattened_cholesky_factors)
+        if self.regularizer is not None:
+            reg = self.regularizer(correlations)
+
+            # Calculate the the scaling on regularisation
+            batch_size = tf.cast(tf.shape(inputs)[0], tf.float32)
+            n_batches = self.regularizer.n_batches
+            scaling_factor = batch_size * n_batches
+            reg = reg / scaling_factor
+
+            self.add_loss(reg)
+            self.add_metric(reg, name=self.name)
+        return correlations
 
 
 class DiagonalMatricesLayer(layers.Layer):
@@ -480,6 +547,8 @@ class DiagonalMatricesLayer(layers.Layer):
         Should the matrices be learnable?
     initial_value : np.ndarray
         Initial values for the matrices.
+    regularizer : tf.keras.regularizers.Regularizer
+        Regularizer for the diagonal entries.
     """
 
     def __init__(
@@ -488,6 +557,7 @@ class DiagonalMatricesLayer(layers.Layer):
         m,
         learn,
         initial_value,
+        regularizer=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -500,7 +570,9 @@ class DiagonalMatricesLayer(layers.Layer):
 
         # Initialisation for the diagonals
         if initial_value is None:
-            self.initial_value = np.ones([n, m], dtype=np.float32)
+            self.initial_value = np.random.normal(1, 0.1, size=[n, m]).astype(
+                np.float32
+            )
         else:
             if initial_value.ndim != 2:
                 raise ValueError(
@@ -513,12 +585,15 @@ class DiagonalMatricesLayer(layers.Layer):
                 )
             if initial_value.shape[0] != n:
                 raise ValueError(
-                    f"mismatch bettwen the number of modes and vectors in "
+                    "mismatch bettwen the number of modes and vectors in "
                     + f"initial_value ({initial_value.shape[0]})."
                 )
             self.initial_value = initial_value.astype("float32")
         self.initial_diagonals = self.bijector.inverse(self.initial_value)
         self.diagonals_initializer = WeightInitializer(self.initial_diagonals)
+
+        # Regulariser
+        self.regularizer = regularizer
 
     def build(self, input_shape):
         self.diagonals = self.add_weight(
@@ -530,8 +605,19 @@ class DiagonalMatricesLayer(layers.Layer):
         )
         self.built = True
 
-    def call(self, alpha, **kwargs):
+    def call(self, inputs, **kwargs):
         D = self.bijector(self.diagonals)
+        if self.regularizer is not None:
+            reg = self.regularizer(D)
+
+            # Calculate the the scaling on regularisation
+            batch_size = tf.cast(tf.shape(inputs)[0], tf.float32)
+            n_batches = self.regularizer.n_batches
+            scaling_factor = batch_size * n_batches
+            reg = reg / scaling_factor
+
+            self.add_loss(reg)
+            self.add_metric(reg, name=self.name)
         D = tf.linalg.diag(D)
         return D
 
@@ -1071,14 +1157,22 @@ class SubjectMapKLDivergenceLayer(layers.Layer):
     subject specific deviation.
     """
 
+    def __init__(self, n_batches=1, **kwargs):
+        super().__init__(**kwargs)
+        self.n_batches = n_batches
+
     def call(self, inputs, **kwargs):
-        inference_mu, inference_sigma, model_sigma = inputs
+        data, inference_mu, inference_sigma, model_sigma = inputs
 
         prior = tfp.distributions.Normal(loc=0.0, scale=model_sigma)
         posterior = tfp.distributions.Normal(loc=inference_mu, scale=inference_sigma)
         kl_loss = tfp.distributions.kl_divergence(
             posterior, prior, allow_nan_stats=False
         )
+        # Calculate the scaling for KL loss
+        batch_size = tf.cast(tf.shape(data)[0], tf.float32)
+        scaling_factor = batch_size * self.n_batches
+        kl_loss = kl_loss / scaling_factor
 
         kl_loss = tf.reduce_sum(kl_loss)
 

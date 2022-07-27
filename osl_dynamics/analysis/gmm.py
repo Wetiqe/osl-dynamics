@@ -3,18 +3,26 @@
 """
 
 import numpy as np
+from scipy import stats, special
 from sklearn.mixture import BayesianGaussianMixture, GaussianMixture
-from osl_dynamics.data.processing import standardize
+
+from osl_dynamics.data import processing
 from osl_dynamics.utils import plotting
 
 
 def fit_gaussian_mixture(
     X,
-    plot_filename=None,
-    print_message=True,
     bayesian=True,
+    logit_transform=False,
+    standardize=True,
     label_order="mean",
-    **kwargs,
+    sklearn_kwargs={},
+    one_component_percentile=None,
+    n_sigma=0,
+    plot_filename=None,
+    plot_kwargs={},
+    print_message=True,
+    return_labels=False,
 ):
     """Fits a two component Bayesian Gaussian mixture model.
 
@@ -22,39 +30,65 @@ def fit_gaussian_mixture(
     ----------
     X : np.ndarray
         Data to fit Gaussian mixture model to.
-    plot_filename : str
-        Filename to save a plot of the Gaussian mixture model.
-    print_message : bool
-        Should we print a message?
     bayesian : bool
         Should we fit a Bayesian GMM?
+    logit_transform : bool
+        Should we logit transform the X?
+    standardize : bool
+        Should we standardize X?
     label_order: str
         How do we order the inferred classes?
-    **kwargs
-        Keyword argument to pass to the sklearn class.
+    sklearn_kwargs : dict
+        Keyword arguments to pass to the sklearn class.
+    one_component_percentile : float
+        Percentile threshold if only one component is found.
+        Should be a between 0 and 100. E.g. for the 95th percentile,
+        one_component_percentile=95.
+    n_sigma : float
+        Number of standard deviations of the 'off' component the mean
+        of the 'on' component must be for the fit to be considered to
+        have two components.
+    plot_filename : str
+        Filename to save a plot of the Gaussian mixture model.
+    plot_kwargs : dict
+        Keyword arguments to pass to plotting function.
+        Only used if plot_filename is not None.
+    print_message : bool
+        Should we print a message?
+    return_labels : bool
+        Should we return the labels?
 
     Returns
     -------
-    y : np.ndarray
-        Class of each data point.
+    y : float or np.ndarray
+        Percentile for thresholding or class of each data point if
+        return_labels=True.
     """
     if print_message:
         print("Fitting GMM")
 
+    # Copy the data so we don't modify it
+    X = np.copy(X)
+
     # Validation
-    if X.ndim == 1:
+    if X.ndim != 1:
+        raise ValueError("X must be a 1D numpy array.")
+    else:
         X = X[:, np.newaxis]
-    elif X.ndim != 2:
-        raise ValueError("X must be a 1D or 2D numpy array.")
+
+    # Logit transform
+    if logit_transform:
+        X = special.logit(X)
 
     # Standardise the data
-    X = standardize(X)
+    if standardize:
+        X = processing.standardize(X, create_copy=False)
 
     # Fit a Gaussian mixture model
     if bayesian:
-        gm = BayesianGaussianMixture(n_components=2, **kwargs)
+        gm = BayesianGaussianMixture(n_components=2, **sklearn_kwargs)
     else:
-        gm = GaussianMixture(n_components=2, **kwargs)
+        gm = GaussianMixture(n_components=2, **sklearn_kwargs)
     gm.fit(X)
 
     # Inferred parameters
@@ -70,16 +104,6 @@ def fit_gaussian_mixture(
     else:
         raise NotImplementedError(label_order)
 
-    # Plots
-    if plot_filename is not None:
-        plotting.plot_gmm(
-            X[:, 0],
-            amplitudes[order],
-            means[order],
-            variances[order],
-            filename=plot_filename,
-        )
-
     # Which component does each data point correspond to
     y = gm.predict(X)
 
@@ -91,5 +115,72 @@ def fit_gaussian_mixture(
     if label_order == "variance":
         if variances[0] > variances[1]:
             y = (1 - y).astype(int)
+    amplitudes = amplitudes[order]
+    means = means[order]
+    variances = variances[order]
 
-    return y
+    # Percentile threshold
+    if (
+        abs(means[1] - means[0]) < n_sigma * np.sqrt(variances[0])
+        and one_component_percentile is not None
+    ):
+        percentile = one_component_percentile
+    else:
+        percentile = get_percentile_threshold(X[:, 0], y, means)
+
+    # Plots
+    if plot_filename is not None:
+        fig, ax = plotting.plot_gmm(
+            X[:, 0],
+            amplitudes,
+            means,
+            variances,
+            title=f"Percentile = {round(percentile)}",
+            **plot_kwargs,
+        )
+        threshold = np.percentile(X[:, 0], percentile)
+        ax.axvline(threshold, color="black", linestyle="--")
+        plotting.save(fig, plot_filename)
+
+    if return_labels:
+        return y
+    else:
+        return percentile
+
+
+def get_percentile_threshold(X, y, mu):
+    """Calculate the percentile threshold for determining class labels
+    from a two component GMM.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Data used to fit a GMM.
+    y : np.ndarray
+        Class labels. This must be an array of 0s and 1s, where 0 indicates an
+        'off' component and 1 indicates an 'on' component.
+    mu : np.ndarray
+        Mean of each class.
+
+    Returns
+    -------
+    threshold : float
+        Largest value out of the two options: smallest value in the X array that
+        belongs to the 'on' class and largest value in the X array that belongs to
+        the 'off' class. Value is returned as a percentile of X.
+    """
+
+    # Get the threshold for determining the class
+    min_threshold = np.min([np.min(X[y == 1]), np.max(X[y == 0])])
+    max_threshold = np.max([np.min(X[y == 1]), np.max(X[y == 0])])
+
+    # Pick the threshold that is between the means
+    if mu[0] < min_threshold < mu[1]:
+        threshold = min_threshold
+    else:
+        threshold = max_threshold
+
+    # What percentile of the full distribution is the threshold?
+    percentile = stats.percentileofscore(X, threshold)
+
+    return percentile
