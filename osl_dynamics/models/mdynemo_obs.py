@@ -2,6 +2,7 @@
 
 """
 
+import logging
 from dataclasses import dataclass
 
 import numpy as np
@@ -9,18 +10,22 @@ import tensorflow as tf
 from tensorflow.keras import layers
 
 import osl_dynamics.data.tf as dtf
-from osl_dynamics.models.mod_base import BaseModelConfig, ModelBase
-from osl_dynamics.models import dynemo_obs
 from osl_dynamics.inference import regularizers
+from osl_dynamics.inference.initializers import WeightInitializer
 from osl_dynamics.inference.layers import (
-    LogLikelihoodLossLayer,
-    MeanVectorsLayer,
-    DiagonalMatricesLayer,
     CorrelationMatricesLayer,
-    MixVectorsLayer,
-    MixMatricesLayer,
+    DiagonalMatricesLayer,
+    LogLikelihoodLossLayer,
     MatMulLayer,
+    MixMatricesLayer,
+    MixVectorsLayer,
+    VectorsLayer,
+    add_epsilon,
 )
+from osl_dynamics.models import dynemo_obs
+from osl_dynamics.models.mod_base import BaseModelConfig, ModelBase
+
+_logger = logging.getLogger("osl-dynamics")
 
 
 @dataclass
@@ -29,21 +34,33 @@ class Config(BaseModelConfig):
 
     Parameters
     ----------
+    model_name : str
+        Model name.
     n_modes : int
-        Number of modes.
+        Number of modes for both power.
+    n_fc_modes : int
+        Number of modes for FC. If none, set to n_modes.
     n_channels : int
         Number of channels.
     sequence_length : int
         Length of sequence passed to the generative model.
 
     learn_means : bool
-        Should we make the mean vectors for each mode trainable?
-    learn_covariances : bool
-        Should we make the covariance matrix for each mode trainable?
+        Should we make the mean for each mode trainable?
+    learn_stds : bool
+        Should we make the standard deviation for each mode trainable?
+    learn_fcs : bool
+        Should we make the functional connectivity for each mode trainable?
     initial_means : np.ndarray
-        Initialisation for mean vectors.
-    initial_covariances : np.ndarray
-        Initialisation for mode covariances.
+        Initialisation for the mode means.
+    initial_stds : np.ndarray
+        Initialisation for mode standard deviations.
+    initial_fcs : np.ndarray
+        Initialisation for mode functional connectivity matrices.
+    stds_epsilon : float
+        Error added to mode stds for numerical stability.
+    fcs_epsilon : float
+        Error added to mode fcs for numerical stability.
     means_regularizer : tf.keras.regularizers.Regularizer
         Regularizer for the mean vectors.
     stds_regularizer : tf.keras.regularizers.Regularizer
@@ -68,13 +85,18 @@ class Config(BaseModelConfig):
         Strategy for distributed learning.
     """
 
+    model_name: str = "M-DyNeMo-Obs"
+
     # Observation model parameters
+    n_fc_modes: int = None
     learn_means: bool = None
     learn_stds: bool = None
     learn_fcs: bool = None
     initial_means: np.ndarray = None
     initial_stds: np.ndarray = None
     initial_fcs: np.ndarray = None
+    stds_epsilon: float = None
+    fcs_epsilon: float = None
     means_regularizer: tf.keras.regularizers.Regularizer = None
     stds_regularizer: tf.keras.regularizers.Regularizer = None
     fcs_regularizer: tf.keras.regularizers.Regularizer = None
@@ -93,6 +115,24 @@ class Config(BaseModelConfig):
         ):
             raise ValueError("learn_means, learn_stds and learn_fcs must be passed.")
 
+        if self.stds_epsilon is None:
+            if self.learn_stds:
+                self.stds_epsilon = 1e-6
+            else:
+                self.stds_epsilon = 0.0
+
+        if self.fcs_epsilon is None:
+            if self.learn_fcs:
+                self.fcs_epsilon = 1e-6
+            else:
+                self.fcs_epsilon = 0.0
+
+    def validate_dimension_parameters(self):
+        super().validate_dimension_parameters()
+        if self.n_fc_modes is None:
+            self.n_fc_modes = self.n_modes
+            _logger.warning("n_fc_modes is None, set to n_modes.")
+
 
 class Model(ModelBase):
     """M-DyNeMo observation model class.
@@ -101,6 +141,8 @@ class Model(ModelBase):
     ----------
     config : osl_dynamics.models.mdynemo_obs.Config
     """
+
+    config_type = Config
 
     def build_model(self):
         """Builds a keras model."""
@@ -131,7 +173,7 @@ class Model(ModelBase):
             Mode standard deviations with shape (n_modes, n_channels) or
             (n_modes, n_channels, n_channels).
         fcs: np.ndarray
-            Mode functional connectivities with shape (n_modes, n_channels, n_channels).
+            Mode functional connectivities with shape (n_fc_modes, n_channels, n_channels).
         update_initializer: bool
             Do we want to use the passed parameters when we re_initialize
             the model?
@@ -155,18 +197,19 @@ class Model(ModelBase):
             dynemo_obs.set_means_regularizer(self.model, training_dataset)
 
         if self.config.learn_stds:
-            set_stds_regularizer(self.model, training_dataset)
+            set_stds_regularizer(self.model, training_dataset, self.config.stds_epsilon)
 
         if self.config.learn_fcs:
-            set_fcs_regularizer(self.model, training_dataset)
+            set_fcs_regularizer(self.model, training_dataset, self.config.fcs_epsilon)
 
 
 def _model_structure(config):
-
     # Layers for inputs
     data = layers.Input(shape=(config.sequence_length, config.n_channels), name="data")
     alpha = layers.Input(shape=(config.sequence_length, config.n_modes), name="alpha")
-    gamma = layers.Input(shape=(config.sequence_length, config.n_modes), name="gamma")
+    gamma = layers.Input(
+        shape=(config.sequence_length, config.n_fc_modes), name="gamma"
+    )
 
     # Observation model:
     # - We use a multivariate normal with a mean vector and covariance matrix for
@@ -175,11 +218,12 @@ def _model_structure(config):
     #   and the observation model.
 
     # Layers
-    means_layer = MeanVectorsLayer(
+    means_layer = VectorsLayer(
         config.n_modes,
         config.n_channels,
         config.learn_means,
         config.initial_means,
+        config.means_regularizer,
         name="means",
     )
     stds_layer = DiagonalMatricesLayer(
@@ -187,20 +231,26 @@ def _model_structure(config):
         config.n_channels,
         config.learn_stds,
         config.initial_stds,
+        config.stds_epsilon,
+        config.stds_regularizer,
         name="stds",
     )
     fcs_layer = CorrelationMatricesLayer(
-        config.n_modes,
+        config.n_fc_modes,
         config.n_channels,
         config.learn_fcs,
         config.initial_fcs,
+        config.fcs_epsilon,
+        config.fcs_regularizer,
         name="fcs",
     )
     mix_means_layer = MixVectorsLayer(name="mix_means")
     mix_stds_layer = MixMatricesLayer(name="mix_stds")
     mix_fcs_layer = MixMatricesLayer(name="mix_fcs")
     matmul_layer = MatMulLayer(name="cov")
-    ll_loss_layer = LogLikelihoodLossLayer(name="ll_loss")
+    ll_loss_layer = LogLikelihoodLossLayer(
+        np.maximum(config.stds_epsilon, config.fcs_epsilon), name="ll_loss"
+    )
 
     # Data flow
     mu = means_layer(data)  # data not used
@@ -224,10 +274,18 @@ def get_means_stds_fcs(model):
     stds_layer = model.get_layer("stds")
     fcs_layer = model.get_layer("fcs")
 
-    means = means_layer.vectors.numpy()
-    stds = tf.linalg.diag(stds_layer.bijector(stds_layer.diagonals)).numpy()
-    fcs = fcs_layer.bijector(fcs_layer.flattened_cholesky_factors).numpy()
-    return means, stds, fcs
+    means = means_layer(1)
+    stds = add_epsilon(
+        stds_layer(1),
+        stds_layer.epsilon,
+        diag=True,
+    )
+    fcs = add_epsilon(
+        fcs_layer(1),
+        fcs_layer.epsilon,
+        diag=True,
+    )
+    return means.numpy(), stds.numpy(), fcs.numpy()
 
 
 def set_means_stds_fcs(model, means, stds, fcs, update_initializer=True):
@@ -249,27 +307,20 @@ def set_means_stds_fcs(model, means, stds, fcs, update_initializer=True):
     flattened_cholesky_factors = fcs_layer.bijector.inverse(fcs)
 
     # Set values
-    means_layer.vectors.assign(means)
-    stds_layer.diagonals.assign(diagonals)
-    fcs_layer.flattened_cholesky_factors.assign(flattened_cholesky_factors)
+    means_layer.vectors_layer.tensor.assign(means)
+    stds_layer.diagonals_layer.tensor.assign(diagonals)
+    fcs_layer.flattened_cholesky_factors_layer.tensor.assign(flattened_cholesky_factors)
 
     # Update initialisers
     if update_initializer:
-        means_layer.initial_value = means
-        stds_layer.initial_value = stds
-        fcs_layer.initial_value = fcs
-
-        stds_layer.initial_diagonals = diagonals
-        fcs_layer.initial_flattened_cholesky_factors = flattened_cholesky_factors
-
-        means_layer.vectors_initializer.initial_value = means
-        stds_layer.diagonals_initializer.initial_value = diagonals
-        fcs_layer.flattened_cholesky_factors_initializer.initial_value = (
-            flattened_cholesky_factors
+        means_layer.vectors_layer.tensor_initializer = WeightInitializer(means)
+        stds_layer.diagonals_layer.tensor_initializer = WeightInitializer(diagonals)
+        fcs_layer.flattened_cholesky_factors_layer.tensor_initializer = (
+            WeightInitializer(flattened_cholesky_factors)
         )
 
 
-def set_stds_regularizer(model, training_dataset):
+def set_stds_regularizer(model, training_dataset, epsilon):
     n_batches = dtf.get_n_batches(training_dataset)
     n_channels = dtf.get_n_channels(training_dataset)
     range_ = dtf.get_range(training_dataset)
@@ -278,18 +329,23 @@ def set_stds_regularizer(model, training_dataset):
     sigma = np.sqrt(np.log(2 * range_))
 
     stds_layer = model.get_layer("stds")
-    stds_layer.regularizer = regularizers.LogNormal(mu, sigma, n_batches)
+    learnable_tensor_layer = stds_layer.layers[0]
+    learnable_tensor_layer.regularizer = regularizers.LogNormal(
+        mu, sigma, epsilon, n_batches
+    )
 
 
-def set_fcs_regularizer(model, training_dataset):
+def set_fcs_regularizer(model, training_dataset, epsilon):
     n_batches = dtf.get_n_batches(training_dataset)
     n_channels = dtf.get_n_channels(training_dataset)
 
     nu = n_channels - 1 + 0.1
 
     fcs_layer = model.get_layer("fcs")
-    fcs_layer.regularizer = regularizers.MarginalInverseWishart(
+    learnable_tensor_layer = fcs_layer.layers[0]
+    learnable_tensor_layer.regularizer = regularizers.MarginalInverseWishart(
         nu,
+        epsilon,
         n_channels,
         n_batches,
     )

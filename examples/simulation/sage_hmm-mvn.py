@@ -5,7 +5,6 @@
 """
 
 print("Setting up")
-import numpy as np
 from osl_dynamics import data, simulation
 from osl_dynamics.inference import metrics, modes, tf_ops
 from osl_dynamics.models.sage import Config, Model
@@ -46,29 +45,15 @@ sim = simulation.HMM_MVN(
 sim.standardize()
 training_data = data.Data(sim.time_series)
 
-
-# Prepare dataset
-training_dataset = training_data.dataset(
-    config.sequence_length,
-    config.batch_size,
-    shuffle=True,
-)
-
-prediction_dataset = training_data.dataset(
-    config.sequence_length,
-    config.batch_size,
-    shuffle=False,
-)
-
 # Build model
 model = Model(config)
 
 print("Training model")
-history = model.fit(training_dataset)
+history = model.fit(training_data)
 
 # Inferred mode mixing factors and mode time course
-inf_alp = model.get_alpha(prediction_dataset)
-inf_stc = modes.time_courses(inf_alp)
+inf_alp = model.get_alpha(training_data)
+inf_stc = modes.argmax_time_courses(inf_alp)
 sim_stc = sim.mode_time_course
 sim_stc, inf_stc = modes.match_modes(sim_stc, inf_stc)
 print("Dice coefficient:", metrics.dice_coefficient(sim_stc, inf_stc))
@@ -76,6 +61,3 @@ print("Dice coefficient:", metrics.dice_coefficient(sim_stc, inf_stc))
 # Fractional occupancies
 print("Fractional occupancies (Simulation):", modes.fractional_occupancies(sim_stc))
 print("Fractional occupancies (Sage):", modes.fractional_occupancies(inf_stc))
-
-# Delete temporary directory
-training_data.delete_dir()

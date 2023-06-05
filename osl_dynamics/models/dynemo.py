@@ -8,29 +8,29 @@ from typing import Literal
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
-from tqdm import trange
+from tqdm.auto import trange
 
-from osl_dynamics.models import dynemo_obs
-from osl_dynamics.models.mod_base import BaseModelConfig
-from osl_dynamics.models.inf_mod_base import (
-    VariationalInferenceModelConfig,
-    VariationalInferenceModelBase,
-)
-from osl_dynamics.inference import regularizers
 from osl_dynamics.inference.layers import (
-    InferenceRNNLayer,
-    LogLikelihoodLossLayer,
-    MeanVectorsLayer,
     CovarianceMatricesLayer,
-    MixVectorsLayer,
-    MixMatricesLayer,
-    ModelRNNLayer,
-    NormalizationLayer,
+    DiagonalMatricesLayer,
+    InferenceRNNLayer,
     KLDivergenceLayer,
     KLLossLayer,
+    LogLikelihoodLossLayer,
+    MixMatricesLayer,
+    MixVectorsLayer,
+    ModelRNNLayer,
+    NormalizationLayer,
     SampleNormalDistributionLayer,
     SoftmaxLayer,
+    VectorsLayer,
 )
+from osl_dynamics.models import dynemo_obs
+from osl_dynamics.models.inf_mod_base import (
+    VariationalInferenceModelBase,
+    VariationalInferenceModelConfig,
+)
+from osl_dynamics.models.mod_base import BaseModelConfig
 
 
 @dataclass
@@ -39,6 +39,8 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
 
     Parameters
     ----------
+    model_name : str
+        Model name.
     n_modes : int
         Number of modes.
     n_channels : int
@@ -59,6 +61,8 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
         E.g. 'relu', 'elu', etc.
     inference_dropout : float
         Dropout rate.
+    inference_regularizer : str
+        Regularizer.
 
     model_rnn : str
         RNN to use, either 'gru' or 'lstm'.
@@ -73,6 +77,8 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
         E.g. 'relu', 'elu', etc.
     model_dropout : float
         Dropout rate.
+    model_regularizer : str
+        Regularizer.
 
     theta_normalization : str
         Type of normalization to apply to the posterior samples, theta.
@@ -89,7 +95,12 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
     initial_means : np.ndarray
         Initialisation for mean vectors.
     initial_covariances : np.ndarray
-        Initialisation for mode covariances.
+        Initialisation for state covariances. If diagonal_covariances=True
+        and full matrices are passed, the diagonal is extracted.
+    covariances_epsilon : float
+        Error added to mode covariances for numerical stability.
+    diagonal_covariances : bool
+        Should we learn diagonal mode covariances?
     means_regularizer : tf.keras.regularizers.Regularizer
         Regularizer for mean vectors.
     covariances_regularizer : tf.keras.regularizers.Regularizer
@@ -122,6 +133,8 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
         Strategy for distributed learning.
     """
 
+    model_name: str = "DyNeMo"
+
     # Inference network parameters
     inference_rnn: Literal["gru", "lstm"] = "lstm"
     inference_n_layers: int = 1
@@ -129,6 +142,7 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
     inference_normalization: Literal[None, "batch", "layer"] = None
     inference_activation: str = None
     inference_dropout: float = 0.0
+    inference_regularizer: str = None
 
     # Model network parameters
     model_rnn: Literal["gru", "lstm"] = "lstm"
@@ -137,12 +151,15 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
     model_normalization: Literal[None, "batch", "layer"] = None
     model_activation: str = None
     model_dropout: float = 0.0
+    model_regularizer: str = None
 
     # Observation model parameters
     learn_means: bool = None
     learn_covariances: bool = None
     initial_means: np.ndarray = None
     initial_covariances: np.ndarray = None
+    diagonal_covariances: bool = False
+    covariances_epsilon: float = None
     means_regularizer: tf.keras.regularizers.Regularizer = None
     covariances_regularizer: tf.keras.regularizers.Regularizer = None
 
@@ -165,6 +182,12 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
         if self.learn_means is None or self.learn_covariances is None:
             raise ValueError("learn_means and learn_covariances must be passed.")
 
+        if self.covariances_epsilon is None:
+            if self.learn_covariances:
+                self.covariances_epsilon = 1e-6
+            else:
+                self.covariances_epsilon = 0.0
+
 
 class Model(VariationalInferenceModelBase):
     """DyNeMo model class.
@@ -173,6 +196,8 @@ class Model(VariationalInferenceModelBase):
     ----------
     config : osl_dynamics.models.dynemo.Config
     """
+
+    config_type = Config
 
     def build_model(self):
         """Builds a keras model."""
@@ -200,6 +225,10 @@ class Model(VariationalInferenceModelBase):
         """
         return dynemo_obs.get_means_covariances(self.model)
 
+    def get_observation_model_parameters(self):
+        """Wrapper for get_means_covariances."""
+        return self.get_means_covariances()
+
     def set_means(self, means, update_initializer=True):
         """Set the means of each mode.
 
@@ -224,25 +253,52 @@ class Model(VariationalInferenceModelBase):
             Do we want to use the passed covariances when we re-initialize
             the model?
         """
-        dynemo_obs.set_covariances(self.model, covariances, update_initializer)
+        dynemo_obs.set_covariances(
+            self.model,
+            covariances,
+            self.config.diagonal_covariances,
+            update_initializer,
+        )
+
+    def set_observation_model_parameters(
+        self, observation_model_parameters, update_initializer=True
+    ):
+        """Wrapper for set_means and set_covariances."""
+        self.set_means(
+            observation_model_parameters[0],
+            update_initializer=update_initializer,
+        )
+        self.set_covariances(
+            observation_model_parameters[1],
+            update_initializer=update_initializer,
+        )
 
     def set_regularizers(self, training_dataset):
         """Set the means and covariances regularizer based on the training data.
 
         A multivariate normal prior is applied to the mean vectors with mu = 0,
-        sigma=diag((range / 2)**2) and an inverse Wishart prior is applied to the
-        covariances matrices with nu=n_channels - 1 + 0.1 and psi=diag(1 / range).
+        sigma=diag((range / 2)**2). If config.diagonal_covariances is True, a log
+        normal prior is applied to the diagonal of the covariances matrices with mu=0,
+        sigma=sqrt(log(2 * (range))), otherwise an inverse Wishart prior is applied
+        to the covariances matrices with nu=n_channels - 1 + 0.1 and psi=diag(1 / range).
 
         Parameters
         ----------
-        training_dataset : tensorflow.data.Dataset
+        training_dataset : tensorflow.data.Dataset or osl_dynamics.data.Data
             Training dataset.
         """
+        training_dataset = self.make_dataset(training_dataset, concatenate=True)
+
         if self.config.learn_means:
             dynemo_obs.set_means_regularizer(self.model, training_dataset)
 
         if self.config.learn_covariances:
-            dynemo_obs.set_covariances_regularizer(self.model, training_dataset)
+            dynemo_obs.set_covariances_regularizer(
+                self.model,
+                training_dataset,
+                self.config.covariances_epsilon,
+                self.config.diagonal_covariances,
+            )
 
     def sample_alpha(self, n_samples, theta_norm=None):
         """Uses the model RNN to sample mode mixing factors, alpha.
@@ -284,8 +340,7 @@ class Model(VariationalInferenceModelBase):
 
         # Sample the mode fixing factors
         alpha = np.empty([n_samples, self.config.n_modes], dtype=np.float32)
-        for i in trange(n_samples, desc="Sampling mode time course", ncols=98):
-
+        for i in trange(n_samples, desc="Sampling mode time course"):
             # If there are leading zeros we trim theta so that we don't pass the zeros
             trimmed_theta = theta_norm[~np.all(theta_norm == 0, axis=1)][
                 np.newaxis, :, :
@@ -312,7 +367,6 @@ class Model(VariationalInferenceModelBase):
 
 
 def _model_structure(config):
-
     # Layer for input
     inputs = layers.Input(
         shape=(config.sequence_length, config.n_channels), name="data"
@@ -332,13 +386,14 @@ def _model_structure(config):
         config.inference_n_layers,
         config.inference_n_units,
         config.inference_dropout,
+        config.inference_regularizer,
         name="inf_rnn",
     )
     inf_mu_layer = layers.Dense(config.n_modes, name="inf_mu")
     inf_sigma_layer = layers.Dense(
         config.n_modes, activation="softplus", name="inf_sigma"
     )
-    theta_layer = SampleNormalDistributionLayer(name="theta")
+    theta_layer = SampleNormalDistributionLayer(config.theta_std_epsilon, name="theta")
     theta_norm_layer = NormalizationLayer(config.theta_normalization, name="theta_norm")
     alpha_layer = SoftmaxLayer(
         config.initial_alpha_temperature,
@@ -362,7 +417,7 @@ def _model_structure(config):
     #   and the observation model.
 
     # Definition of layers
-    means_layer = MeanVectorsLayer(
+    means_layer = VectorsLayer(
         config.n_modes,
         config.n_channels,
         config.learn_means,
@@ -370,17 +425,29 @@ def _model_structure(config):
         config.means_regularizer,
         name="means",
     )
-    covs_layer = CovarianceMatricesLayer(
-        config.n_modes,
-        config.n_channels,
-        config.learn_covariances,
-        config.initial_covariances,
-        config.covariances_regularizer,
-        name="covs",
-    )
+    if config.diagonal_covariances:
+        covs_layer = DiagonalMatricesLayer(
+            config.n_modes,
+            config.n_channels,
+            config.learn_covariances,
+            config.initial_covariances,
+            config.covariances_epsilon,
+            config.covariances_regularizer,
+            name="covs",
+        )
+    else:
+        covs_layer = CovarianceMatricesLayer(
+            config.n_modes,
+            config.n_channels,
+            config.learn_covariances,
+            config.initial_covariances,
+            config.covariances_epsilon,
+            config.covariances_regularizer,
+            name="covs",
+        )
     mix_means_layer = MixVectorsLayer(name="mix_means")
     mix_covs_layer = MixMatricesLayer(name="mix_covs")
-    ll_loss_layer = LogLikelihoodLossLayer(name="ll_loss")
+    ll_loss_layer = LogLikelihoodLossLayer(config.covariances_epsilon, name="ll_loss")
 
     # Data flow
     mu = means_layer(inputs)  # inputs not used
@@ -403,13 +470,14 @@ def _model_structure(config):
         config.model_n_layers,
         config.model_n_units,
         config.model_dropout,
+        config.model_regularizer,
         name="mod_rnn",
     )
     mod_mu_layer = layers.Dense(config.n_modes, name="mod_mu")
     mod_sigma_layer = layers.Dense(
         config.n_modes, activation="softplus", name="mod_sigma"
     )
-    kl_div_layer = KLDivergenceLayer(name="kl_div")
+    kl_div_layer = KLDivergenceLayer(config.theta_std_epsilon, name="kl_div")
     kl_loss_layer = KLLossLayer(config.do_kl_annealing, name="kl_loss")
 
     # Data flow

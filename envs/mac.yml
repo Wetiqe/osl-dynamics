@@ -1,0 +1,23 @@
+name: osld
+dependencies:
+  - python=3
+  - numba
+  - pip
+  - pip:
+    - glmtools
+    - mat73
+    - matplotlib
+    - mne
+    - nibabel
+    - nilearn
+    - numpy
+    - pandas
+    - pyyaml
+    - pqdm
+    - scipy
+    - scikit-learn
+    - seaborn
+    - tabulate
+    - tensorflow-macos
+    - tensorflow_probability
+    - tqdm

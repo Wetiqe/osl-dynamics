@@ -4,12 +4,14 @@
 
 print("Setting up")
 import os
+
 import numpy as np
+from tqdm.auto import trange
+
 from osl_dynamics import data, simulation
 from osl_dynamics.inference import metrics, modes, tf_ops
 from osl_dynamics.models.dynemo import Config, Model
 from osl_dynamics.utils import plotting
-from tqdm import trange
 
 # Create directory to hold plots
 os.makedirs("figures", exist_ok=True)
@@ -52,20 +54,12 @@ sim = simulation.MixedSine_MVN(
     covariances="random",
     random_seed=123,
 )
-sim_stc = sim.mode_time_course
+sim_alp = sim.mode_time_course
 training_data = data.Data(sim.time_series)
 
 # Plot ground truth logits
 plotting.plot_separate_time_series(
     sim.logits, n_samples=2000, filename="figures/sim_logits.png"
-)
-
-# Prepare tensorflow datasets for training and model evaluation
-training_dataset = training_data.dataset(
-    config.sequence_length, config.batch_size, shuffle=True
-)
-prediction_dataset = training_data.dataset(
-    config.sequence_length, config.batch_size, shuffle=False
 )
 
 # Build model
@@ -74,41 +68,37 @@ model.summary()
 
 print("Training model")
 history = model.fit(
-    training_dataset,
-    epochs=config.n_epochs,
+    training_data,
     save_best_after=config.n_kl_annealing_epochs,
     save_filepath="tmp/weights",
 )
 
 # Free energy = Log Likelihood - KL Divergence
-free_energy = model.free_energy(prediction_dataset)
+free_energy = model.free_energy(training_data)
 print(f"Free energy: {free_energy}")
 
 # Inferred alpha and mode time course
-inf_alp = model.get_alpha(prediction_dataset)
-sim_stc, inf_stc = modes.match_modes(sim_stc, inf_alp)
+inf_alp = model.get_alpha(training_data)
+sim_alp, inf_alp = modes.match_modes(sim_alp, inf_alp)
 
 # Compare the inferred mode time course to the ground truth
-plotting.plot_separate_time_series(
-    sim_stc, inf_stc, n_samples=2000, filename="figures/stc.png"
-)
 plotting.plot_alpha(
-    sim_stc,
+    sim_alp,
     n_samples=2000,
     title="Ground Truth",
     y_labels=r"$\alpha_{jt}$",
-    filename="figures/sim_stc.png",
+    filename="figures/sim_alp.png",
 )
 plotting.plot_alpha(
-    inf_stc,
+    inf_alp,
     n_samples=2000,
     title="DyNeMo",
     y_labels=r"$\alpha_{jt}$",
-    filename="figures/inf_stc.png",
+    filename="figures/inf_alp.png",
 )
 
 # Correlation between mode time courses
-corr = metrics.alpha_correlation(inf_stc, sim_stc)
+corr = metrics.alpha_correlation(inf_alp, sim_alp)
 print("Correlation (DyNeMo vs Simulation):", corr)
 
 # Reconstruction of the time-varying covariance
@@ -116,7 +106,7 @@ sim_cov = sim.covariances
 inf_cov = model.get_covariances()
 
 sim_tvcov = np.sum(
-    sim_stc[:, :, np.newaxis, np.newaxis] * sim_cov[np.newaxis, :, :, :], axis=1
+    sim_alp[:, :, np.newaxis, np.newaxis] * sim_cov[np.newaxis, :, :, :], axis=1
 )
 inf_tvcov = np.sum(
     inf_alp[:, :, np.newaxis, np.newaxis] * inf_cov[np.newaxis, :, :, :], axis=1
@@ -125,7 +115,7 @@ inf_tvcov = np.sum(
 # Calculate the Riemannian distance between the ground truth and inferred covariance
 print("Calculating riemannian distances")
 rd = np.empty(2000)
-for i in trange(2000, ncols=98):
+for i in trange(2000):
     rd[i] = metrics.riemannian_distance(sim_tvcov[i], inf_tvcov[i])
 
 plotting.plot_line(

@@ -82,7 +82,7 @@ print(f"Free energy: {free_energy}")
 
 # Inferred mode mixing factors and mode time courses
 alpha = model.get_alpha(prediction_dataset)
-inf_stc = modes.time_courses(alpha)
+inf_stc = modes.argmax_time_courses(alpha)
 hmm_stc = processing.trim_time_series(
     time_series=hmm.mode_time_course(),
     sequence_length=config.sequence_length,
@@ -90,6 +90,3 @@ hmm_stc = processing.trim_time_series(
 
 # Dice coefficient
 print("Dice coefficient:", metrics.dice_coefficient(hmm_stc, inf_stc))
-
-# Delete temporary directory
-prepared_data.delete_dir()

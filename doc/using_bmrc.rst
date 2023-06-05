@@ -38,97 +38,6 @@ Copy files from the cluster to your local machine:
 
     rsync -Phr <username>@cluster1.bmrc.ox.ac.uk:/path/to/file /path/on/local/machine
 
-Installing OSL Dynamics on BMRC
--------------------------------
-
-It is recommended to install osl-dynamics within a virtual environment. Depending on the GPU node a different version of CUDA maybe available. This means different versions of TensorFlow maybe required on different GPU nodes (older nodes may not be able to run the latest version of TensorFlow). Below are installation instructions for different TensorFlow versions.
-
-Recommended Installation
-************************
-
-To install with the latest TensorFlow version use:
-
-.. code-block:: shell
-
-    module load Anaconda3
-    module load cuDNN
-    conda create --name osld python=3
-    conda activate osld
-    cd osl-dynamics
-    pip install -e .
-
-TensorFlow 2.3
-**************
-
-Update setup.cfg with dependencies:
-
-.. code-block:: shell
-
-    tensorflow==2.3.0
-    tensorflow_probability==0.11.1
-
-Install:
-
-.. code-block:: shell
-
-    module load Anaconda3
-    module load cudnn
-    conda create --name osld-tf23 python=3.8
-    conda activate osld-tf23
-    cd osl-dynamics
-    pip install -e .
-
-TensorFlow 2.4
-**************
-
-Update setup.cfg with dependencies:
-
-.. code-block:: shell
-
-    tensorflow==2.4.1
-    tensorflow_probability==0.12.2
-
-Install:
-
-.. code-block:: shell
-
-    module load Anaconda3
-    module load cuDNN
-    conda create --name osld-tf24 python=3.8
-    conda activate osld-tf24
-    cd osl-dynamics
-    pip install -e .
-
-TensorFlow 2.5 (Not recommended)
-********************************
-
-This version is not recommended because of issues encountered when training with multiple GPUs on BMRC. Update setup.cfg with dependencies:
-
-.. code-block:: shell
-
-    tensorflow==2.5
-    tensorflow_probability==0.13
-
-Install:
-
-.. code-block:: shell
-
-    module use /well/woolrich/projects/software/modulefiles
-    module load Anaconda3
-    module load cuda/11.2
-    conda create --name osld-tf25 python=3.8
-    conda activate osld-tf25
-    cd osl-dynamics
-    pip install -e .
-
-HMM
-***
-To use the HMM implementation in this package you also need to install armadillo:
-
-.. code-block:: shell
-
-    conda install -c conda-forge armadillo
-
 Submitting Jobs
 ---------------
 
@@ -137,38 +46,68 @@ Request an interactive job on a normal node:
 .. code-block:: shell
 
     screen
-    qlogin -q short.qc (or long.qc)
+    srun -p short --pty bash
 
 ``Ctrl-A Crtl-D`` can be used to exit the screen session.
 
 List screens with: ``screen -ls``. Reconnect to a session with: ``screen -r <id>``.
 
-To submit a non-interactive GPU job, first create a ``submission.sh`` file:
+To request an interactive job on a node with a GPU:
+
+.. code-block:: shell
+
+    screen
+    srun -p gpu_short --gres gpu:1 --pty bash
+
+To submit a non-interactive GPU job, first create a ``job.sh`` file:
 
 .. code-block:: shell
 
     #!/bin/bash
-    #$ -q short.qg
-    #$ -l gpu=1
-    #$ -cwd
-    #$ -j y
-    #$ -o stdout.log
-
-    # Setup your environment
-    module load Anaconda3
-    module load cuDNN
-    source activate osld-tf24
+    #SBATCH -p gpu_short
+    #SBATCH --gres gpu:1
 
     # Run scripts
     python dynemo_hmm_mvn.py
 
-Submit with: ``qsub submission.sh``.
+Note, the job will inherit the environment and working directory from when you submit the job.
 
-Monitor jobs: ``watch qstat``.
+Submit with: ``sbatch job.sh``.
 
-Delete all jobs: ``qdel -u <username>``.
+Monitor jobs: ``watch squeue -u <username>``.
 
-Further info: `https://www.medsci.ox.ac.uk/divisional-services/support-services-1/bmrc/gpu-resources <https://www.medsci.ox.ac.uk/divisional-services/support-services-1/bmrc/gpu-resources>`_.
+Cancel a particular job: ``scancel <job-id>``.
+
+Cancel all your jobs: ``scancel -u <username>``.
+
+Further info:
+
+- `https://www.medsci.ox.ac.uk/divisional-services/support-services-1/bmrc/gpu-resources <https://www.medsci.ox.ac.uk/divisional-services/support-services-1/bmrc/gpu-resources>`_.
+- `https://www.medsci.ox.ac.uk/for-staff/resources/bmrc/using-the-bmrc-cluster-with-slurm <https://www.medsci.ox.ac.uk/for-staff/resources/bmrc/using-the-bmrc-cluster-with-slurm>`_
+
+Modules
+-------
+
+The BMRC server uses software modules for popular packages. We install osl-dynamics within an Anaconda environment. We can load Anaconda with:
+
+.. code-block:: shell
+
+    module load Anaconda3/2022.05
+
+We also need CUDA to use the GPUs on BMRC. We load CUDA with:
+
+.. code-block:: shell
+
+    module load cuDNN
+
+Similarly we can load other useful software packages, e.g.
+
+.. code-block:: shell
+
+    module load git
+    module load matlab/2019a
+
+All of the above lines can be added to ``/users/woolrich/<username>/.bashrc`` which will load the modules automatically when you log in.
 
 Using OSL Dynamics on BMRC
 --------------------------
@@ -215,3 +154,57 @@ We recommend using VSCode locally and the ``Remote - SSH`` extension to edit rem
 - You will be asked for your SSO password then BMRC password.
 - If you are working on the university VPN, you can omit ``ProxyJump <oxford-sso-username>@linux.ox.ac.uk`` line.
 - You can set up SSH keys for the university linux server if you want to avoid typing two passwords every time. `Guide <https://www.ssh.com/academy/ssh/copy-id>`_.
+
+Formatting and Conventions
+**************************
+
+We use the python code formatter ``black`` to give a consistent code layout in our source files. To install:
+
+.. code-block:: shell
+
+    conda activate <env>
+    pip install black
+
+To format a source file:
+
+.. code-block:: shell
+
+    black <filename>.py
+
+Please run ``black`` on any edited files before commiting changes.
+
+Git Workflow
+************
+
+We use git for version control. There is one ``main`` branch. To add changes:
+
+Create a feature branch for changes:
+
+.. code-block:: shell
+
+    git checkout main
+    git pull
+    git checkout -b <branch-name>
+
+Make changes to file and commit it to the branch:
+
+.. code-block:: shell
+
+    git add <file>
+    git commit -m "Short description of changes"
+
+When writing commit messages please follow the conventions `here <https://www.conventionalcommits.org/en/v1.0.0-beta.2/#specification>`_.
+
+Then either push the new branch to the remote repository:
+
+.. code-block:: shell
+
+    git push --set-upstream origin <branch-name>
+
+and create a pull request (recommended), or merge branch into ``main`` and push:
+
+.. code-block:: shell
+
+    git checkout main
+    git merge <branch-name>
+    git push

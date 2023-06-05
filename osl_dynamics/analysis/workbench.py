@@ -9,7 +9,8 @@ import subprocess
 import warnings
 
 import nibabel as nib
-from tqdm import trange
+from tqdm.auto import trange
+
 from osl_dynamics import files
 
 surfs = {
@@ -59,8 +60,11 @@ def render(
     """
     nii = pathlib.Path(nii)
 
-    if not nii.exists() or ".nii" not in nii.suffixes:
+    if ".nii" not in nii.suffixes:
         raise ValueError(f"nii should be a nii or nii.gz file, got {nii}.")
+
+    if not nii.exists():
+        raise FileNotFoundError(nii)
 
     if save_dir is None:
         save_dir = pathlib.Path.cwd()
@@ -163,7 +167,7 @@ def image(cifti_left, cifti_right, file_name, inflation=0, temp_scene=None):
     pathlib.Path(file_path).parent.mkdir(exist_ok=True, parents=True)
     file_pattern = f"{file_path}{{:0{max_int_length}d}}{suffix}"
 
-    for i in trange(n_modes, desc="Saving images", ncols=98):
+    for i in trange(n_modes, desc="Saving images"):
         subprocess.run(
             [
                 "wb_command",

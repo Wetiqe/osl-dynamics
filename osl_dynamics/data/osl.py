@@ -4,22 +4,34 @@
 
 import numpy as np
 from osl_dynamics import array_ops
+from osl_dynamics.data.processing import trim_time_series
 from osl_dynamics.data.rw import loadmat
-from osl_dynamics.inference import modes
 
 
-class OSL_HMM:
-    """Imports and encapsulates OSL HMMs as python objects.
+def OSL_HMM(filename):
+    """Wrapper for osl_dynamics.data.osl.HMM_MAR.
 
     Parameters
     ----------
     filename : str
-        The location of the OSL HMM saved as a mat7.3 file.
+        The location of the HMM-MAR object saved as a mat7.3 file.
+    """
+    return HMM_MAR(filename)
+
+
+class HMM_MAR:
+    """Imports and encapsulates HMM-MAR objects as a python class.
+
+    Parameters
+    ----------
+    filename : str
+        The location of the HMM-MAR object saved as a mat7.3 file.
     """
 
     def __init__(self, filename):
         self.filename = filename
-        self.hmm = loadmat(filename)
+        hmm = loadmat(filename)
+        self.hmm = hmm["hmm"] if "hmm" in hmm else hmm
 
         self.state = self.hmm["state"]
         self.mode = self.hmm["state"]
@@ -32,16 +44,16 @@ class OSL_HMM:
         self.train = self.hmm["train"]
 
         # State probabilities
-        if "gamma" in self.hmm:
-            self.gamma = self.hmm["gamma"].astype(np.float32)
-        elif "Gamma" in self.hmm:
-            self.gamma = self.hmm["Gamma"].astype(np.float32)
-        else:
-            self.gamma = None
+        self.Gamma = None
+        for gamma in ["gamma", "Gamma"]:
+            if gamma in self.hmm:
+                self.Gamma = self.hmm[gamma].astype(np.float32)
+            elif gamma in hmm:
+                self.Gamma = hmm[gamma].astype(np.float32)
 
         # State time course
-        if self.gamma is not None:
-            vpath = self.gamma.argmax(axis=1)
+        if self.Gamma is not None:
+            vpath = self.Gamma.argmax(axis=1)
             self.vpath = array_ops.get_one_hot(vpath).astype(np.float32)
         else:
             self.vpath = None
@@ -65,61 +77,70 @@ class OSL_HMM:
         # points for different subjects
         if "T" in self.hmm:
             self.discontinuities = [np.squeeze(T).astype(int) for T in self.hmm["T"]]
-        elif self.gamma is not None:
+        elif self.Gamma is not None:
             # Assume gamma has no discontinuities
-            self.discontinuities = [self.gamma.shape[0]]
+            self.discontinuities = [self.Gamma.shape[0]]
         else:
             self.discontinuities = None
 
     def __str__(self):
         return f"OSL HMM object from file {self.filename}"
 
-    def alpha(self, concatenate=False, pad=None):
-        """Alpha for each subject.
-
-        Alpha is equivalent to gamma in OSL HMM.
+    def gamma(self, concatenate=False, pad=None):
+        """State probabilities for each subject.
 
         Parameters
         ----------
         concatenate : bool
-            Should we concatenate the alphas for each subejcts?
+            Should we concatenate the gammas for each subjects?
         pad : int
-            Pad the alpha for each subject with zeros to replace the data points lost
+            Pad the gamma for each subject with zeros to replace the data points lost
             by performing n_embeddings. Default is no padding.
 
         Returns
         -------
-        alpha : np.ndarray or list
+        gamma : np.ndarray or list
             State probabilities.
         """
-        if self.gamma is None:
+        if self.Gamma is None:
             return None
 
         if pad is None:
             if concatenate or len(self.discontinuities) == 1:
-                return self.gamma
+                return self.Gamma
             else:
-                return np.split(self.gamma, np.cumsum(self.discontinuities[:-1]))
+                return np.split(self.Gamma, np.cumsum(self.discontinuities[:-1]))
         else:
-            padded_alpha = [
-                np.pad(alpha, [[pad, pad], [0, 0]])
-                for alpha in np.split(self.gamma, np.cumsum(self.discontinuities[:-1]))
+            padded_gamma = [
+                np.pad(gamma, [[pad, pad], [0, 0]])
+                for gamma in np.split(self.Gamma, np.cumsum(self.discontinuities[:-1]))
             ]
             if concatenate:
-                return np.concatenate(padded_alpha)
+                return np.concatenate(padded_gamma)
             else:
-                return padded_alpha
+                return padded_gamma
 
-    def fractional_occupancies(self):
-        """Fractional Occupancy of each state.
+    def trimmed_gamma(self, sequence_length, concatenate=False):
+        """Trimmed state probabilities for each subject.
+
+        Data points that would be lost due to separating the time series into
+        sequences are removed from each subject.
+
+        Parameters
+        ----------
+        sequence_length : int
+            Sequence length.
+        concatenate : bool
+            Should we concatenate the gammas for each subject?
 
         Returns
         -------
-        fo : np.ndarray
-            Fractional occupancies.
+        gamma : np.ndarray or list
+            State probabilities.
         """
-        stc = self.state_time_course(concatenate=True)
-        return modes.fractional_occupancies(stc)
+        return trim_time_series(
+            self.gamma(), sequence_length=sequence_length, concatenate=concatenate
+        )
 
     def state_time_course(self, concatenate=False, pad=None):
         """State time course for each subject.
@@ -164,15 +185,3 @@ class OSL_HMM:
             Mode time course.
         """
         return self.state_time_course(*args, **kwargs)
-
-    def covariance_weights(self):
-        """Calculate covariance weightings based on variance (trace).
-
-        Method to wrap `array_ops.trace_weights`.
-
-        Returns
-        -------
-        weights: np.ndarray
-            Statewise weights.
-        """
-        return array_ops.trace_weights(self.covariances)

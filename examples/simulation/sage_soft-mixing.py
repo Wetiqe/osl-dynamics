@@ -1,14 +1,17 @@
-"""Example script for demonstrating Sage's ability to infer a soft mixture of modes.
+"""Example script for demonstrating SAGE's ability to infer a soft mixture of modes.
 
 """
+
 print("Setting up")
 import os
+
 import numpy as np
+from tqdm.auto import trange
+
 from osl_dynamics import data, simulation
 from osl_dynamics.inference import metrics, modes, tf_ops
 from osl_dynamics.models.sage import Config, Model
 from osl_dynamics.utils import plotting
-from tqdm import trange
 
 # GPU settings
 tf_ops.gpu_growth()
@@ -34,7 +37,6 @@ config = Config(
     learning_rate=0.001,
     n_epochs=500,
 )
-
 
 print("Simulating data")
 sim = simulation.MixedSine_MVN(
@@ -113,7 +115,7 @@ inf_tvcov = np.sum(
 # Calculate the Riemannian distance between the ground truth and inferred covariance
 print("Calculating riemannian distances")
 rd = np.empty(2000)
-for i in trange(2000, ncols=98):
+for i in trange(2000):
     rd[i] = metrics.riemannian_distance(sim_tvcov[i], inf_tvcov[i])
 
 plotting.plot_line(
@@ -125,6 +127,3 @@ plotting.plot_line(
     fig_kwargs={"figsize": (15, 1.5)},
     filename="figures/rd.png",
 )
-
-# Delete temporary directory
-training_data.delete_dir()

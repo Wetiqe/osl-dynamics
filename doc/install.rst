@@ -1,55 +1,77 @@
-Install
-=======
+Installation
+============
 
-The recommended installation is described below.
+Instructions
+------------
 
-Conda Environments
-------------------
-We recommend installing osl-dynamics within a conda environment, see https://docs.conda.io/en/latest for further details.
-A conda environment can be created and activated with:
+OSL Dynamics can be installed in three steps. Open a Terminal and execute the following commands:
+
+#. Create a virtual environment, we recommend using Anaconda: https://docs.anaconda.com/anaconda/install/index.html.
+
+    Once you have installed Anaconda (or Miniconda) execute:
+
+    ::
+
+        conda create --name osld python=3.10
+        conda activate osld
+
+    Note, this environment must be activated every time you want to use osl-dynamics.
+
+#. Install the deep learning library TensorFlow: https://www.tensorflow.org/overview.
+
+    ::
+
+        pip install tensorflow
+
+    If you are using an Apple computer with an M1/M2 chip the above command won't work, instead you can install TensorFlow with:
+
+    ::
+
+        pip install tensorflow-macos
+
+    If you have GPU resources you need to install additional libraries (CUDA/cuDNN), see https://www.tensorflow.org/install/pip for detailed instructions. You maybe able you install a GPU-enabled version of TensorFlow using Anaconda:
+
+    ::
+
+        conda install -c conda-forge tensorflow-gpu
+
+#. Install osl-dynamics:
+
+    ::
+
+        pip install osl-dynamics
+
+To remove osl-dynamics simply delete the conda environment:
 
 ::
 
-    conda create --name osld python=3
-    conda activate osld
+    conda env remove -n osld
+    conda clean --all
 
 
-NOTE: this conda environment must be activated everytime you would like to use osl-dynamics.
-
-Pip Installation
-----------------
-
-osl-dynamics can be installed in your conda environment with:
-
-::
-
-    pip install osl-dynamics
-
-This will install the latest version of TensorFlow compatible with your Python version.
-
-For Developers
+Training Speed
 --------------
 
-Developers will want to install from source in editable mode:
+You can test if you've succesfully installed osl-dynamics by running the HMM and DyNeMo simulation example scripts:
 
-::
+- `HMM example <https://github.com/OHBA-analysis/osl-dynamics/blob/main/examples/simulation/hmm_hmm-mvn.py>`_.
+- `DyNeMo example <https://github.com/OHBA-analysis/osl-dynamics/blob/main/examples/simulation/dynemo_hmm-mvn.py>`_.
 
-    conda create --name osld python=3
-    conda activate osld
-    git clone git@github.com:OHBA-analysis/osl-dynamics.git
-    cd osl-dynamics
-    pip install -e .
+A rough indication of the expected training speeds is given below. You could expect variations up to a factor of 2.
 
-To use the HMM you will also need to install armadillo:
+.. list-table:: Training speed: **ms/step**
+   :widths: 25 25 25
+   :header-rows: 1
 
-::
-
-    conda install -c conda-forge armadillo
-
-Additional packages needed for development can be installed with:
-
-::
-
-    pip install black
-    pip install -r doc/requirements.txt
-    pip install build twine
+   * - Computer
+     - HMM
+     - DyNeMo
+   * - M1/M2 Macbook
+     - 50
+     - 60
+   * - Linux with 1 GPU
+     - 100
+     - 20
+   * - Linux CPU
+     - 100
+     - 100

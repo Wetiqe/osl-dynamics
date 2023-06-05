@@ -1,8 +1,7 @@
 """Base simulation class.
 
 """
-
-from osl_dynamics.data.processing import standardize
+import numpy as np
 
 
 class Simulation:
@@ -35,4 +34,6 @@ class Simulation:
         return 1
 
     def standardize(self, axis=0):
-        self.time_series = standardize(self.time_series, axis=axis)
+        mu = np.mean(self.time_series, axis=axis, keepdims=True)
+        sigma = np.std(self.time_series, axis=axis, keepdims=True)
+        self.time_series = (self.time_series - mu) / sigma

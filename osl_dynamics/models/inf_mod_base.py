@@ -2,14 +2,18 @@
 
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 
-from osl_dynamics.models.mod_base import ModelBase
+import osl_dynamics.data.tf as dtf
 from osl_dynamics.inference import callbacks, initializers
+from osl_dynamics.models.mod_base import ModelBase
 from osl_dynamics.utils.misc import replace_argument
+
+_logger = logging.getLogger("osl-dynamics")
 
 
 @dataclass
@@ -20,6 +24,7 @@ class VariationalInferenceModelConfig:
     theta_normalization: Literal[None, "batch", "layer"] = None
     learn_alpha_temperature: bool = None
     initial_alpha_temperature: float = None
+    theta_std_epsilon: float = 1e-6
 
     # KL annealing parameters
     do_kl_annealing: bool = False
@@ -115,26 +120,34 @@ class VariationalInferenceModelBase(ModelBase):
 
         return super().fit(*args, **kwargs)
 
-    def initialize(
+    def random_subset_initialization(
         self,
-        training_dataset,
-        epochs,
+        training_data,
+        n_epochs,
         n_init,
+        take,
+        n_kl_annealing_epochs=None,
         **kwargs,
     ):
-        """Multi-start training.
+        """Random subset initialization.
 
-        The model is trained for a few epochs with different random initializations
-        for weights and the model with the best free energy is kept.
+        The model is trained for a few epochs with different random subsets
+        of the training dataset. The model with the best free energy is kept.
 
         Parameters
         ----------
-        training_dataset : tensorflow.data.Dataset
+        training_data : tensorflow.data.Dataset or osl_dynamics.data.Data
             Dataset to use for training.
-        epochs : int
+        n_epochs : int
             Number of epochs to train the model.
         n_init : int
             Number of initializations.
+        take : float
+            Fraction of total batches to take.
+        n_kl_annealing_epochs : int
+            Number of KL annealing epochs.
+        kwargs : keyword arguments
+            Keyword arguments for the fit method.
 
         Returns
         -------
@@ -142,45 +155,170 @@ class VariationalInferenceModelBase(ModelBase):
             The training history of the best initialization.
         """
         if n_init is None or n_init == 0:
-            print(
+            _logger.warning(
                 "Number of initializations was set to zero. "
                 + "Skipping initialization."
             )
             return
 
-        # Pick the initialization with the lowest free energy
-        best_free_energy = np.Inf
-        for n in range(n_init):
-            print(f"Initialization {n}")
-            self.reset_weights()
-            self.compile()
-            history = self.fit(
-                training_dataset,
-                epochs=epochs,
-                **kwargs,
-            )
-            free_energy = history.history["loss"][-1]
-            if free_energy < best_free_energy:
-                best_initialization = n
-                best_free_energy = free_energy
-                best_weights = self.model.get_weights()
-                best_history = history
+        _logger.info("Random subset initialization")
 
-        print(f"Using initialization {best_initialization}")
-        self.model.set_weights(best_weights)
-        if self.config.do_kl_annealing:
-            self.reset_kl_annealing_factor()
-        self.compile()
+        # Original number of KL annealing epochs
+        original_n_kl_annealing_epochs = self.config.n_kl_annealing_epochs
+
+        # Use n_kl_annealing_epochs if passed
+        self.config.n_kl_annealing_epochs = (
+            n_kl_annealing_epochs or original_n_kl_annealing_epochs
+        )
+
+        # Make a TensorFlow Dataset
+        training_data = self.make_dataset(training_data, shuffle=True, concatenate=True)
+
+        # Calculate the number of batches to use
+        n_total_batches = dtf.get_n_batches(training_data)
+        n_batches = max(round(n_total_batches * take), 1)
+        _logger.info(f"Using {n_batches} out of {n_total_batches} batches")
+
+        # Pick the initialization with the lowest free energy
+        best_loss = np.Inf
+        for n in range(n_init):
+            _logger.info(f"Initialization {n}")
+            self.reset()
+            training_data_subset = training_data.shuffle(100000).take(n_batches)
+            history = self.fit(training_data_subset, epochs=n_epochs, **kwargs)
+            loss = history["loss"][-1]
+            if loss < best_loss:
+                best_initialization = n
+                best_loss = loss
+                best_history = history
+                best_weights = self.get_weights()
+
+        _logger.info(f"Using initialization {best_initialization}")
+        self.set_weights(best_weights)
+        self.reset_kl_annealing_factor()
+
+        # Reset the number of KL annealing epochs
+        self.config.n_kl_annealing_epochs = original_n_kl_annealing_epochs
 
         return best_history
+
+    def single_subject_initialization(
+        self, training_data, n_epochs, n_init, n_kl_annealing_epochs=None, **kwargs
+    ):
+        """Initialization for the mode means/covariances.
+
+        Pick a subject at random, train a model, repeat a few times. Use
+        the means/covariances from the best model (judged using the final loss).
+
+        Parameters
+        ----------
+        training_data : list of tensorflow.data.Dataset or osl_dynamics.data.Data
+            Datasets for each subject.
+        n_epochs : int
+            Number of epochs to train.
+        n_init : int
+            How many subjects should we train on?
+        n_kl_annealing_epochs : int
+            Number of KL annealing epochs to use during initialization. If None
+            then the KL annealing epochs in the config is used.
+        kwargs : keyword arguments
+            Keyword arguments for the fit method.
+        """
+        if n_init is None or n_init == 0:
+            _logger.warning(
+                "Number of initializations was set to zero. "
+                + "Skipping initialization."
+            )
+            return
+
+        _logger.info("Single subject initialization")
+
+        # Original number of KL annealing epochs
+        original_n_kl_annealing_epochs = self.config.n_kl_annealing_epochs
+
+        # Use n_kl_annealing_epochs if passed
+        self.config.n_kl_annealing_epochs = (
+            n_kl_annealing_epochs or original_n_kl_annealing_epochs
+        )
+
+        # Make a list of tensorflow Datasets if the data
+        training_data = self.make_dataset(training_data, shuffle=True)
+
+        if not isinstance(training_data, list):
+            raise ValueError(
+                "training_data must be a list of Datasets or a Data object."
+            )
+
+        # Pick n_init subjects at random
+        n_all_subjects = len(training_data)
+        subjects_to_use = np.random.choice(range(n_all_subjects), n_init, replace=False)
+
+        # Train the model a few times and keep the best one
+        best_loss = np.Inf
+        losses = []
+        for subject in subjects_to_use:
+            _logger.info(f"Using subject {subject}")
+
+            # Get the dataset for this subject
+            subject_dataset = training_data[subject]
+
+            # Reset the model weights and train
+            self.reset()
+            history = self.fit(subject_dataset, epochs=n_epochs, **kwargs)
+            loss = history["loss"][-1]
+            losses.append(loss)
+            _logger.info(f"Subject {subject} loss: {loss}")
+
+            # Record the loss of this subject's data
+            if loss < best_loss:
+                best_loss = loss
+                subject_chosen = subject
+                best_weights = self.get_weights()
+
+        _logger.info(f"Using means and covariances from subject {subject_chosen}")
+
+        # Use the weights from the best initialisation for the full training
+        self.set_weights(best_weights)
+        self.reset_kl_annealing_factor()
+
+        # Reset the number of KL annealing epochs
+        self.config.n_kl_annealing_epochs = original_n_kl_annealing_epochs
+
+    def multistart_initialization(
+        self,
+        training_data,
+        n_epochs,
+        n_init,
+        n_kl_annealing_epochs=None,
+        **kwargs,
+    ):
+        """Multi-start initialization.
+
+        Wrapper for random_subset_initialization with take=1.
+
+        Returns
+        -------
+        history : history
+            The training history of the best initialization.
+        """
+
+        return self.random_subset_initialization(
+            training_data,
+            n_epochs,
+            n_init,
+            take=1,
+            n_kl_annealing_epochs=n_kl_annealing_epochs,
+            **kwargs,
+        )
 
     def reset_kl_annealing_factor(self):
         """Sets the KL annealing factor to zero.
 
         This method assumes there is a keras layer named 'kl_loss' in the model.
         """
-        kl_loss_layer = self.model.get_layer("kl_loss")
-        kl_loss_layer.annealing_factor.assign(0.0)
+        if self.config.do_kl_annealing:
+            kl_loss_layer = self.model.get_layer("kl_loss")
+            kl_loss_layer.annealing_factor.assign(0.0)
 
     def reset_weights(self, keep=None):
         """Reset the model as if you've built a new model.
@@ -191,10 +329,9 @@ class VariationalInferenceModelBase(ModelBase):
             Layer names to NOT reset.
         """
         initializers.reinitialize_model_weights(self.model, keep)
-        if self.config.do_kl_annealing:
-            self.reset_kl_annealing_factor()
+        self.reset_kl_annealing_factor()
 
-    def predict(self, *args, **kwargs) -> dict:
+    def predict(self, *args, **kwargs):
         """Wrapper for the standard keras predict method.
 
         Returns
@@ -210,13 +347,13 @@ class VariationalInferenceModelBase(ModelBase):
 
         return predictions_dict
 
-    def get_alpha(self, inputs, *args, concatenate=False, **kwargs):
+    def get_alpha(self, dataset, concatenate=False):
         """Mode mixing factors, alpha.
 
         Parameters
         ----------
-        inputs : tensorflow.data.Dataset
-            Prediction dataset.
+        dataset : tensorflow.data.Dataset or osl_dynamics.data.Data
+            Prediction dataset. This can be a list of datasets, one for each subject.
         concatenate : bool
             Should we concatenate alpha for each subject?
 
@@ -227,33 +364,33 @@ class VariationalInferenceModelBase(ModelBase):
             (n_samples, n_modes).
         """
         if self.config.multiple_dynamics:
-            return self.get_mode_time_courses(
-                inputs, *args, concatenate=concatenate, **kwargs
-            )
+            return self.get_mode_time_courses(dataset)
 
-        inputs = self._make_dataset(inputs)
-        outputs = []
-        for dataset in inputs:
-            alpha = self.predict(dataset, *args, **kwargs)["alpha"]
+        dataset = self.make_dataset(dataset)
+
+        _logger.info("Getting alpha")
+        alpha = []
+        for ds in dataset:
+            a = self.predict(ds)["alpha"]
+            a = np.concatenate(a)
+            alpha.append(a)
+
+        if concatenate or len(alpha) == 1:
             alpha = np.concatenate(alpha)
-            outputs.append(alpha)
 
-        if concatenate or len(outputs) == 1:
-            outputs = np.concatenate(outputs)
+        return alpha
 
-        return outputs
-
-    def get_mode_time_courses(self, inputs, *args, concatenate=False, **kwargs):
+    def get_mode_time_courses(self, dataset, concatenate=False):
         """Get mode time courses.
 
         This method is used to get mode time courses for the multi-time-scale model.
 
         Parameters
         ----------
-        inputs : tensorflow.data.Dataset
-            Prediction dataset.
+        dataset : tensorflow.data.Dataset or osl_dynamics.data.Data
+            Prediction data. This can be a list of datasets, one for each subject.
         concatenate : bool
-            Should we concatenate alpha for each subject?
+            Should we concatenate alpha/gamma for each subject?
 
         Returns
         -------
@@ -267,34 +404,32 @@ class VariationalInferenceModelBase(ModelBase):
         if not self.config.multiple_dynamics:
             raise ValueError("Please use get_alpha for a single time scale model.")
 
-        inputs = self._make_dataset(inputs)
+        dataset = self.make_dataset(dataset)
 
-        outputs_alpha = []
-        outputs_gamma = []
-        for dataset in inputs:
-            predictions = self.predict(dataset, *args, **kwargs)
+        _logger.info("Getting mode time courses")
+        alpha = []
+        gamma = []
+        for ds in dataset:
+            predictions = self.predict(ds)
+            a = predictions["alpha"]
+            g = predictions["gamma"]
+            a = np.concatenate(a)
+            g = np.concatenate(g)
+            alpha.append(a)
+            gamma.append(g)
 
-            alpha = predictions["alpha"]
-            gamma = predictions["gamma"]
-
+        if concatenate or len(alpha) == 1:
             alpha = np.concatenate(alpha)
             gamma = np.concatenate(gamma)
 
-            outputs_alpha.append(alpha)
-            outputs_gamma.append(gamma)
-
-        if concatenate or len(outputs_alpha) == 1:
-            outputs_alpha = np.concatenate(outputs_alpha)
-            outputs_gamma = np.concatenate(outputs_gamma)
-
-        return outputs_alpha, outputs_gamma
+        return alpha, gamma
 
     def losses(self, dataset):
         """Calculates the log-likelihood and KL loss for a dataset.
 
         Parameters
         ----------
-        dataset : tensorflow.data.Dataset
+        dataset : tensorflow.data.Dataset or osl_dynamics.data.Data
             Dataset to calculate losses for.
 
         Returns
@@ -304,24 +439,25 @@ class VariationalInferenceModelBase(ModelBase):
         kl_loss : float
             KL divergence loss.
         """
-        if isinstance(dataset, list):
-            predictions = [self.predict(subject) for subject in dataset]
-            ll_loss = np.mean([np.mean(p["ll_loss"]) for p in predictions])
-            kl_loss = np.mean([np.mean(p["kl_loss"]) for p in predictions])
-
-        else:
-            predictions = self.predict(dataset)
-            ll_loss = np.mean(predictions["ll_loss"])
-            kl_loss = np.mean(predictions["kl_loss"])
-
+        dataset = self.make_dataset(dataset, concatenate=True)
+        _logger.info("Getting losses")
+        predictions = self.predict(dataset)
+        ll_loss = np.mean(predictions["ll_loss"])
+        kl_loss = np.mean(predictions["kl_loss"])
         return ll_loss, kl_loss
 
     def free_energy(self, dataset):
         """Calculates the variational free energy of a dataset.
 
+        Note, this method returns a free energy which may have a significantly
+        smaller KL loss. This is because during training we sample from the
+        posterior, however, when we're evaluating the model, we take the maximum
+        a posteriori estimate (posterior mean). This has the effect of giving a
+        lower KL loss for a given dataset.
+
         Parameters
         ----------
-        dataset : tensorflow.data.Dataset
+        dataset : tensorflow.data.Dataset or osl_dynamics.data.Data.
             Dataset to calculate the variational free energy for.
 
         Returns
@@ -329,6 +465,7 @@ class VariationalInferenceModelBase(ModelBase):
         free_energy : float
             Variational free energy for the dataset.
         """
+        dataset = self.make_dataset(dataset, concatenate=True)
         ll_loss, kl_loss = self.losses(dataset)
         free_energy = ll_loss + kl_loss
         return free_energy

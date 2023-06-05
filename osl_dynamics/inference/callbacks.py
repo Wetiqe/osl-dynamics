@@ -63,7 +63,7 @@ class DiceCoefficientCallback(callbacks.Callback):
         """
 
         # Predict time courses
-        predictions = self.model.predict(self.prediction_dataset)
+        predictions = self.model.predict(self.prediction_dataset, verbose=0)
         tc = predictions[2:]  # first two outputs are losses, rest are time courses
         if len(tc) != self.n_time_courses:
             raise ValueError(
@@ -73,7 +73,7 @@ class DiceCoefficientCallback(callbacks.Callback):
         # For each time course calculate the dice with respect to the ground truth
         dices = []
         for i in range(self.n_time_courses):
-            pmtc = inference.modes.time_courses(
+            pmtc = inference.modes.argmax_time_courses(
                 tc[i], concatenate=True, n_modes=self.n_modes
             )
             pmtc, gtmtc = inference.modes.match_modes(pmtc, self.gtmtc[i])
@@ -83,18 +83,13 @@ class DiceCoefficientCallback(callbacks.Callback):
         # Add dice to the training history and print to screen
         if self.n_time_courses == 1:
             logs["dice"] = dices[0]
-            message = f" - dice: {dices[0]}"
         else:
-            message = []
             for i in range(self.n_time_courses):
                 if self.mode_names is not None:
                     key = "dice_" + self.mode_names[i]
                 else:
                     key = "dice" + str(i)
                 logs[key] = dices[i]
-                message.append(f" - {key}: {dices[i]}")
-            message = "".join(message)
-        print(message)
 
 
 class KLAnnealingCallback(callbacks.Callback):

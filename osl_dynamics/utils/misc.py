@@ -3,11 +3,39 @@
 """
 
 import inspect
+import logging
+import pickle
+import sys
 from copy import copy
 from pathlib import Path
 
 import numpy as np
 import yaml
+from yaml.constructor import ConstructorError
+
+_logger = logging.getLogger("osl-dynamics")
+
+
+def leading_zeros(number, largest_number):
+    """Pad a number with leading zeros.
+
+    This is useful for creating a consistent naming scheme for files.
+
+    Parameters
+    ----------
+    number : int
+        Number to be padded.
+    largest_number : int
+        Largest number in the set.
+
+    Returns
+    -------
+    padded_number : str
+        Number padded with leading zeros.
+    """
+    min_length = len(str(largest_number))
+    padded_number = str(number).zfill(min_length)
+    return padded_number
 
 
 def override_dict_defaults(default_dict, override_dict=None):
@@ -97,6 +125,38 @@ def replace_argument(func, name, item, args, kwargs, append=False):
     else:
         kwargs[name] = item
     return args, kwargs
+
+
+def get_argument(func, name, args, kwargs):
+    """Get an argument passed to a function call whether it is a normal
+    argument or keyword argument.
+
+    Parameters
+    ----------
+    func : callable
+        The function being called.
+    name : str
+        Name of the variable to be modified.
+    args : dict
+        Arguments.
+    kwargs : dict
+        Keyword arguments.
+
+    Returns
+    -------
+    args : argument
+    """
+    args = copy(listify(args))
+    kwargs = copy(kwargs)
+    param_order = list(inspect.signature(func).parameters)
+    param_position = param_order.index(name)
+    if len(args) > param_position:
+        arg = args[param_position]
+    else:
+        if name not in kwargs:
+            return None
+        arg = kwargs[name]
+    return arg
 
 
 def check_arguments(args, kwargs, index, name, value, comparison_op):
@@ -344,8 +404,101 @@ def class_from_yaml(cls, file, kwargs):
     if actually_missing.size > 0:
         raise ValueError(f"Missing arguments: {', '.join(actually_missing[:, 0])}")
     if extra:
-        print(f"Extra arguments: {', '.join(extra)}")
+        _logger.warning(f"Extra arguments: {', '.join(extra)}")
     if using_default.size > 0:
-        print(f"Using defaults for: {', '.join(using_default[:, 0])}")
+        _logger.warning(f"Using defaults for: {', '.join(using_default[:, 0])}")
 
     return cls(**{key: value for key, value in args.items() if key not in extra})
+
+
+class NumpyLoader(yaml.UnsafeLoader):
+    def find_python_name(self, name, mark, unsafe=False):
+        if not name:
+            raise ConstructorError(
+                "while constructing a Python object",
+                mark,
+                "expected non-empty name appended to the tag",
+                mark,
+            )
+        if "." in name:
+            module_name, object_name = name.rsplit(".", 1)
+        else:
+            module_name = "builtins"
+            object_name = name
+        if "numpy" in module_name:
+            try:
+                __import__(module_name)
+            except ImportError as exc:
+                raise ConstructorError(
+                    "while constructing a Python object",
+                    mark,
+                    "cannot find module %r (%s)" % (module_name, exc),
+                    mark,
+                )
+        if module_name not in sys.modules:
+            raise ConstructorError(
+                "while constructing a Python object",
+                mark,
+                "module %r is not imported" % module_name,
+                mark,
+            )
+        module = sys.modules[module_name]
+        if not hasattr(module, object_name):
+            raise ConstructorError(
+                "while constructing a Python object",
+                mark,
+                "cannot find %r in the module %r" % (object_name, module.__name__),
+                mark,
+            )
+        return getattr(module, object_name)
+
+
+def save(filename, array):
+    """Save a file.
+
+    Parameters
+    ----------
+    filename : str
+        Path to file to save to. Must be '.npy' or '.pkl'.
+    array : np.ndarray or list
+        Array to save.
+    """
+    # Validation
+    ext = Path(filename).suffix
+    if ext not in [".npy", ".pkl"]:
+        raise ValueError(f"filename extension must be .npy or .pkl.")
+
+    # Save
+    _logger.info(f"Saving {filename}")
+    if ext == ".pkl":
+        pickle.dump(array, open(filename, "wb"))
+    else:
+        np.save(filename, array)
+
+
+def load(filename):
+    """Load a file.
+
+    Parameters
+    ----------
+    filename : str
+        Path to file to load. Must be '.npy' or '.pkl'.
+
+    Returns
+    -------
+    array : np.ndarray or list
+        Array loaded from the file.
+    """
+    # Validation
+    ext = Path(filename).suffix
+    if ext not in [".npy", ".pkl"]:
+        raise ValueError(f"filename extension must be .npy or .pkl.")
+
+    # Load
+    _logger.info(f"Loading {filename}")
+    if ext == ".pkl":
+        array = pickle.load(open(filename, "rb"))
+    else:
+        array = np.load(filename)
+
+    return array

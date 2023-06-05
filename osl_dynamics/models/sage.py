@@ -2,26 +2,29 @@
 
 """
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 from tensorflow.keras import layers, models, optimizers, utils
-from tqdm import trange
+from tqdm.auto import trange
 
+from osl_dynamics.inference.layers import (
+    AdversarialLogLikelihoodLossLayer,
+    ConcatVectorsMatricesLayer,
+    CovarianceMatricesLayer,
+    InferenceRNNLayer,
+    MixMatricesLayer,
+    MixVectorsLayer,
+    ModelRNNLayer,
+    VectorsLayer,
+)
 from osl_dynamics.models import dynemo_obs
 from osl_dynamics.models.mod_base import BaseModelConfig, ModelBase
-from osl_dynamics.inference.layers import (
-    InferenceRNNLayer,
-    MeanVectorsLayer,
-    CovarianceMatricesLayer,
-    MixVectorsLayer,
-    MixMatricesLayer,
-    ModelRNNLayer,
-    MixVectorsMatricesLayer,
-    AdversarialLogLikelihoodLossLayer,
-)
+
+_logger = logging.getLogger("osl-dynamics")
 
 
 @dataclass
@@ -30,6 +33,8 @@ class Config(BaseModelConfig):
 
     Parameters
     ----------
+    model_name : str
+        Model name.
     n_modes : int
         Number of modes.
     n_channels : int
@@ -49,6 +54,8 @@ class Config(BaseModelConfig):
         E.g. 'relu', 'elu', etc.
     inference_dropout : float
         Dropout rate.
+    inference_regularizer : str
+        Regularizer.
 
     model_rnn : str
         RNN to use, either 'gru' or 'lstm'.
@@ -63,6 +70,8 @@ class Config(BaseModelConfig):
         E.g. 'relu', 'elu', etc.
     model_dropout : float
         Dropout rate.
+    model_regularizer : str
+        Regularizer.
 
     discriminator_rnn : str
         RNN to use, either 'gru' or 'lstm'.
@@ -77,6 +86,8 @@ class Config(BaseModelConfig):
         E.g. 'relu', 'elu', etc.
     discriminator_dropout : float
         Dropout rate.
+    discriminator_regularizer : str
+        Regularizer.
 
     learn_means : bool
         Should we make the mean vectors for each mode trainable?
@@ -86,6 +97,8 @@ class Config(BaseModelConfig):
         Initialisation for mean vectors.
     initial_covariances : np.ndarray
         Initialisation for mode covariances.
+    covariances_epsilon : float
+        Error added to mode covariances for numerical stability.
 
     batch_size : int
         Mini-batch size.
@@ -101,6 +114,8 @@ class Config(BaseModelConfig):
         Strategy for distributed learning.
     """
 
+    model_name: str = "SAGE"
+
     # Inference network parameters
     inference_rnn: Literal["gru", "lstm"] = "lstm"
     inference_n_layers: int = 1
@@ -108,6 +123,7 @@ class Config(BaseModelConfig):
     inference_normalization: Literal[None, "batch", "layer"] = None
     inference_activation: str = "elu"
     inference_dropout: float = 0.0
+    inference_regularizer: str = None
 
     # Model network parameters
     model_rnn: Literal["gru", "lstm"] = "lstm"
@@ -116,6 +132,7 @@ class Config(BaseModelConfig):
     model_normalization: Literal[None, "batch", "layer"] = None
     model_activation: str = "elu"
     model_dropout: float = 0.0
+    model_regularizer: str = None
 
     # Descriminator network parameters
     discriminator_rnn: Literal["gru", "lstm"] = "lstm"
@@ -124,16 +141,29 @@ class Config(BaseModelConfig):
     discriminator_normalization: Literal[None, "batch", "layer"] = None
     discriminator_activation: str = "elu"
     discriminator_dropout: float = 0.0
+    discriminator_regularizer: str = None
 
     # Observation model parameters
     learn_means: bool = None
     learn_covariances: bool = None
     initial_means: np.ndarray = None
     initial_covariances: np.ndarray = None
+    covariances_epsilon: float = None
 
     def __post_init__(self):
         self.validate_dimension_parameters()
         self.validate_training_parameters()
+        self.validate_observation_model_parameters()
+
+    def validate_observation_model_parameters(self):
+        if self.learn_means is None or self.learn_covariances is None:
+            raise ValueError("learn_means and learn_covariances must be passed.")
+
+        if self.covariances_epsilon is None:
+            if self.learn_covariances:
+                self.covariances_epsilon = 1e-6
+            else:
+                self.covariances_epsilon = 0.0
 
 
 class Model(ModelBase):
@@ -144,11 +174,13 @@ class Model(ModelBase):
     config : osl_dynamics.models.sage.Config
     """
 
+    config_type = Config
+
     def build_model(self):
         """Builds a keras model for the inference, generator and discriminator model
         and the full SAGE model.
         """
-        print("Build models")
+        _logger.info("Build models")
         self.inference_model = _build_inference_model(self.config)
         self.inference_model.summary()
         print()
@@ -212,12 +244,12 @@ class Model(ModelBase):
             optimizer=optimizer,
         )
 
-    def fit(self, train_data, epochs=None, verbose=1):
+    def fit(self, training_data, epochs=None, verbose=1):
         """Train the model.
 
         Parameters
         ----------
-        train_data : tensorflow.data.Dataset
+        training_data : tensorflow.data.Dataset or osl_dynamics.data.Data
             Training dataset.
         epochs : int
             Number of epochs to train. Defaults to value in config if not passed.
@@ -232,6 +264,9 @@ class Model(ModelBase):
         if epochs is None:
             epochs = self.config.n_epochs
 
+        # Make sure training data is a TensorFlow Dataset
+        training_data = self.make_dataset(training_data, shuffle=True, concatenate=True)
+
         # Path to save the best model weights
         timestr = time.strftime("%Y%m%d-%H%M%S")  # current date-time
         filepath = "tmp/"
@@ -242,9 +277,9 @@ class Model(ModelBase):
         for epoch in range(epochs):
             if verbose:
                 print("Epoch {}/{}".format(epoch + 1, epochs))
-                pb_i = utils.Progbar(len(train_data), stateful_metrics=["D", "G"])
+                pb_i = utils.Progbar(len(training_data), stateful_metrics=["D", "G"])
 
-            for idx, batch in enumerate(train_data):
+            for idx, batch in enumerate(training_data):
                 # Generate real/fake input for the discriminator
                 real = np.ones((len(batch["data"]), self.config.sequence_length, 1))
                 fake = np.zeros((len(batch["data"]), self.config.sequence_length, 1))
@@ -265,7 +300,7 @@ class Model(ModelBase):
 
             if generator_loss[0] < best_val_loss:
                 self.save_weights(save_filepath)
-                print(
+                _logger.info(
                     "Best model w/ val loss (generator) {} saved to {}".format(
                         generator_loss[0], save_filepath
                     )
@@ -276,7 +311,7 @@ class Model(ModelBase):
             history.append({"D": discriminator_loss[1], "G": generator_loss[0]})
 
         # Load the weights for the best model
-        print("Loading best model:", save_filepath)
+        _logger.info(f"Loading best model: {save_filepath}")
         self.load_weights(save_filepath)
 
         return history
@@ -292,13 +327,13 @@ class Model(ModelBase):
 
         return train
 
-    def get_alpha(self, inputs, concatenate=True):
+    def get_alpha(self, inputs, concatenate=False):
         """Mode mixing factors, alpha.
 
         Parameters
         ----------
-        inputs : tensorflow.data.Dataset
-            Prediction dataset.
+        inputs : tensorflow.data.Dataset or osl_dynamics.data.Data
+            Prediction data.
 
         Returns
         -------
@@ -306,6 +341,9 @@ class Model(ModelBase):
             Mode mixing factors with shape (n_subjects, n_samples, n_modes) or
             (n_samples, n_modes).
         """
+        inputs = self.make_dataset(inputs, concatenate=concatenate)
+
+        _logger.info("Getting alpha:")
         outputs = []
         for dataset in inputs:
             alpha = self.inference_model.predict(dataset)[1]
@@ -386,7 +424,6 @@ class Model(ModelBase):
         for i in trange(
             n_samples - self.config.sequence_length,
             desc="Predicting mode time course",
-            ncols=98,
         ):
             # Extract the sequence
             alpha_input = alpha[i : i + self.config.sequence_length]
@@ -418,6 +455,7 @@ def _build_inference_model(config):
         config.inference_n_layers,
         config.inference_n_units,
         config.inference_dropout,
+        config.inference_regularizer,
         name="inf_rnn",
     )
 
@@ -437,7 +475,7 @@ def _build_inference_model(config):
     #   and the observation model.
 
     # Definition of layers
-    means_layer = MeanVectorsLayer(
+    means_layer = VectorsLayer(
         config.n_modes,
         config.n_channels,
         config.learn_means,
@@ -449,18 +487,19 @@ def _build_inference_model(config):
         config.n_channels,
         config.learn_covariances,
         config.initial_covariances,
+        config.covariances_epsilon,
         name="covs",
     )
     mix_means_layer = MixVectorsLayer(name="mix_means")
     mix_covs_layer = MixMatricesLayer(name="mix_covs")
-    mix_means_covs_layer = MixVectorsMatricesLayer(name="mix_means_covs")
+    concat_means_covs_layer = ConcatVectorsMatricesLayer(name="concat_means_covs")
 
     # Data flow
     mu = means_layer(inputs)  # inputs not used
     D = covs_layer(inputs)  # inputs not used
     m = mix_means_layer([alpha, mu])
     C = mix_covs_layer([alpha, D])
-    C_m = mix_means_covs_layer([m, C])
+    C_m = concat_means_covs_layer([m, C])
 
     return models.Model(inputs, [C_m, alpha], name="inference")
 
@@ -486,6 +525,7 @@ def _build_generator_model(config):
         config.model_n_layers,
         config.model_n_units,
         config.model_dropout,
+        config.model_regularizer,
         name="gen_rnn",
     )
     prior_layer = layers.TimeDistributed(
@@ -517,6 +557,7 @@ def _build_discriminator_model(config):
         config.discriminator_n_layers,
         config.discriminator_n_units,
         config.discriminator_dropout,
+        config.discriminator_regularizer,
         name="dis_rnn",
     )
     sigmoid_layer = layers.TimeDistributed(

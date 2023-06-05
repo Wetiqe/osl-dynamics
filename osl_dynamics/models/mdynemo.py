@@ -2,38 +2,40 @@
 
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
-from tqdm import trange
+from tqdm.auto import trange
 
-from osl_dynamics.models import dynemo_obs, mdynemo_obs
-from osl_dynamics.models.mod_base import BaseModelConfig
-from osl_dynamics.models.inf_mod_base import (
-    VariationalInferenceModelConfig,
-    VariationalInferenceModelBase,
-)
-from osl_dynamics.inference import regularizers
 from osl_dynamics.inference.layers import (
-    InferenceRNNLayer,
-    LogLikelihoodLossLayer,
-    MeanVectorsLayer,
-    DiagonalMatricesLayer,
+    ConcatenateLayer,
     CorrelationMatricesLayer,
-    MixVectorsLayer,
-    MixMatricesLayer,
-    ModelRNNLayer,
-    NormalizationLayer,
+    DiagonalMatricesLayer,
+    InferenceRNNLayer,
     KLDivergenceLayer,
     KLLossLayer,
+    LogLikelihoodLossLayer,
+    MatMulLayer,
+    MixMatricesLayer,
+    MixVectorsLayer,
+    ModelRNNLayer,
+    NormalizationLayer,
     SampleNormalDistributionLayer,
     SoftmaxLayer,
-    ConcatenateLayer,
-    MatMulLayer,
+    VectorsLayer,
 )
+from osl_dynamics.models import dynemo_obs, mdynemo_obs
+from osl_dynamics.models.inf_mod_base import (
+    VariationalInferenceModelBase,
+    VariationalInferenceModelConfig,
+)
+from osl_dynamics.models.mod_base import BaseModelConfig
+
+_logger = logging.getLogger("osl-dynamics")
 
 
 @dataclass
@@ -42,8 +44,12 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
 
     Parameters
     ----------
+    model_name : str
+        Model name.
     n_modes : int
-        Number of modes.
+        Number of modes for both power.
+    n_fc_modes : int
+        Number of modes for FC. If None, then set to n_modes.
     n_channels : int
         Number of channels.
     sequence_length : int
@@ -62,6 +68,8 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
         E.g. 'relu', 'elu', etc.
     inference_dropout : float
         Dropout rate.
+    inference_regularizer : str
+        Regularizer.
 
     model_rnn : str
         RNN to use, either 'gru' or 'lstm'.
@@ -76,6 +84,8 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
         E.g. 'relu', 'elu', etc.
     model_dropout : float
         Dropout rate.
+    model_regularizer : str
+        Regularizer.
 
     theta_normalization : str
         Type of normalization to apply to the posterior samples, theta.
@@ -100,6 +110,10 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
         Initialisation for mode standard deviations.
     initial_fcs : np.ndarray
         Initialisation for mode functional connectivity matrices.
+    stds_epsilon : float
+        Error added to mode stds for numerical stability.
+    fcs_epsilon : float
+        Error added to mode fcs for numerical stability.
     means_regularizer : tf.keras.regularizers.Regularizer
         Regularizer for the mean vectors.
     stds_regularizer : tf.keras.regularizers.Regularizer
@@ -134,6 +148,8 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
         Strategy for distributed learning.
     """
 
+    model_name: str = "M-DyNeMo"
+
     # Inference network parameters
     inference_rnn: Literal["gru", "lstm"] = "lstm"
     inference_n_layers: int = 1
@@ -141,6 +157,7 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
     inference_normalization: Literal[None, "batch", "layer"] = None
     inference_activation: str = None
     inference_dropout: float = 0.0
+    inference_regularizer: str = None
 
     # Model network parameters
     model_rnn: Literal["gru", "lstm"] = "lstm"
@@ -149,14 +166,18 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
     model_normalization: Literal[None, "batch", "layer"] = None
     model_activation: str = None
     model_dropout: float = 0.0
+    model_regularizer: str = None
 
     # Observation model parameters
+    n_fc_modes: int = None
     learn_means: bool = None
     learn_stds: bool = None
     learn_fcs: bool = None
     initial_means: np.ndarray = None
     initial_stds: np.ndarray = None
     initial_fcs: np.ndarray = None
+    stds_epsilon: float = None
+    fcs_epsilon: float = None
     means_regularizer: tf.keras.regularizers.Regularizer = None
     stds_regularizer: tf.keras.regularizers.Regularizer = None
     fcs_regularizer: tf.keras.regularizers.Regularizer = None
@@ -185,6 +206,24 @@ class Config(BaseModelConfig, VariationalInferenceModelConfig):
         ):
             raise ValueError("learn_means, learn_stds and learn_fcs must be passed.")
 
+        if self.stds_epsilon is None:
+            if self.learn_stds:
+                self.stds_epsilon = 1e-6
+            else:
+                self.stds_epsilon = 0.0
+
+        if self.fcs_epsilon is None:
+            if self.learn_fcs:
+                self.fcs_epsilon = 1e-6
+            else:
+                self.fcs_epsilon = 0.0
+
+    def validate_dimension_parameters(self):
+        super().validate_dimension_parameters()
+        if self.n_fc_modes is None:
+            self.n_fc_modes = self.n_modes
+            _logger.warning("n_fc_modes is None, set to n_modes.")
+
 
 class Model(VariationalInferenceModelBase):
     """M-DyNeMo model class.
@@ -193,6 +232,8 @@ class Model(VariationalInferenceModelBase):
     ----------
     config : osl_dynamics.models.mdynemo.Config
     """
+
+    config_type = Config
 
     def build_model(self):
         """Builds a keras model."""
@@ -212,6 +253,10 @@ class Model(VariationalInferenceModelBase):
         """
         return mdynemo_obs.get_means_stds_fcs(self.model)
 
+    def get_observation_model_parameters(self):
+        """Wrapper for get_means_stds_fcs."""
+        return self.get_means_stds_fcs()
+
     def set_means_stds_fcs(self, means, stds, fcs, update_initializer=True):
         """Set the means, standard deviations, functional connectivities of each mode.
 
@@ -223,12 +268,23 @@ class Model(VariationalInferenceModelBase):
             Mode standard deviations with shape (n_modes, n_channels) or
             (n_modes, n_channels, n_channels).
         fcs: np.ndarray
-            Mode functional connectivities with shape (n_modes, n_channels, n_channels).
+            Mode functional connectivities with shape (n_fc_modes, n_channels, n_channels).
         update_initializer: bool
             Do we want to use the passed parameters when we re_initialize
             the model?
         """
         mdynemo_obs.set_means_stds_fcs(self.model, means, stds, fcs, update_initializer)
+
+    def set_observation_model_parameters(
+        self, observation_model_parameters, update_initializer=True
+    ):
+        """Wrapper for set_means_stds_fcs."""
+        self.set_means_stds_fcs(
+            observation_model_parameters[0],
+            observation_model_parameters[1],
+            observation_model_parameters[2],
+            update_initializer=update_initializer,
+        )
 
     def set_regularizers(self, training_dataset):
         """Set the regularizers of means, stds and fcs based on the training data.
@@ -240,17 +296,23 @@ class Model(VariationalInferenceModelBase):
 
         Parameters
         ----------
-        training_dataset : tensorflow.data.Dataset
+        training_dataset : tensorflow.data.Dataset or osl_dynamics.data.Data
             Training dataset.
         """
+        training_dataset = self.make_dataset(training_dataset, concatenate=True)
+
         if self.config.learn_means:
             dynemo_obs.set_means_regularizer(self.model, training_dataset)
 
         if self.config.learn_stds:
-            mdynemo_obs.set_stds_regularizer(self.model, training_dataset)
+            mdynemo_obs.set_stds_regularizer(
+                self.model, training_dataset, self.config.stds_epsilon
+            )
 
         if self.config.learn_fcs:
-            mdynemo_obs.set_fcs_regularizer(self.model, training_dataset)
+            mdynemo_obs.set_fcs_regularizer(
+                self.model, training_dataset, self.config.fcs_epsilon
+            )
 
     def sample_time_courses(self, n_samples: int):
         """Uses the model RNN to sample mode mixing factors, alpha and gamma.
@@ -284,7 +346,7 @@ class Model(VariationalInferenceModelBase):
             0, 1, [n_samples + 1, self.config.n_modes]
         ).astype(np.float32)
         fc_epsilon = np.random.normal(
-            0, 1, [n_samples + 1, self.config.n_modes]
+            0, 1, [n_samples + 1, self.config.n_fc_modes]
         ).astype(np.float32)
 
         # Initialise sequence of underlying logits theta
@@ -294,15 +356,15 @@ class Model(VariationalInferenceModelBase):
         )
         mean_theta_norm[-1] = np.random.normal(size=self.config.n_modes)
         fc_theta_norm = np.zeros(
-            [self.config.sequence_length, self.config.n_modes],
+            [self.config.sequence_length, self.config.n_fc_modes],
             dtype=np.float32,
         )
-        fc_theta_norm[-1] = np.random.normal(size=self.config.n_modes)
+        fc_theta_norm[-1] = np.random.normal(size=self.config.n_fc_modes)
 
         # Sample the mode time courses
         alpha = np.empty([n_samples, self.config.n_modes])
-        gamma = np.empty([n_samples, self.config.n_modes])
-        for i in trange(n_samples, desc="Sampling mode time courses", ncols=98):
+        gamma = np.empty([n_samples, self.config.n_fc_modes])
+        for i in trange(n_samples, desc="Sampling mode time courses"):
             # If there are leading zeros we trim theta so that we don't pass the zeros
             trimmed_mean_theta = mean_theta_norm[~np.all(mean_theta_norm == 0, axis=1)][
                 np.newaxis, :, :
@@ -337,7 +399,6 @@ class Model(VariationalInferenceModelBase):
 
 
 def _model_structure(config):
-
     # Layer for input
     inputs = layers.Input(
         shape=(config.sequence_length, config.n_channels), name="data"
@@ -356,6 +417,7 @@ def _model_structure(config):
         config.inference_n_layers,
         config.inference_n_units,
         config.inference_dropout,
+        config.inference_regularizer,
         name="inf_rnn",
     )
 
@@ -372,7 +434,9 @@ def _model_structure(config):
     mean_inf_sigma_layer = layers.Dense(
         config.n_modes, activation="softplus", name="mean_inf_sigma"
     )
-    mean_theta_layer = SampleNormalDistributionLayer(name="mean_theta")
+    mean_theta_layer = SampleNormalDistributionLayer(
+        config.theta_std_epsilon, name="mean_theta"
+    )
     mean_theta_norm_layer = NormalizationLayer(
         config.theta_normalization, name="mean_theta_norm"
     )
@@ -394,11 +458,13 @@ def _model_structure(config):
     #
 
     # Layers
-    fc_inf_mu_layer = layers.Dense(config.n_modes, name="fc_inf_mu")
+    fc_inf_mu_layer = layers.Dense(config.n_fc_modes, name="fc_inf_mu")
     fc_inf_sigma_layer = layers.Dense(
-        config.n_modes, activation="softplus", name="fc_inf_sigma"
+        config.n_fc_modes, activation="softplus", name="fc_inf_sigma"
     )
-    fc_theta_layer = SampleNormalDistributionLayer(name="fc_theta")
+    fc_theta_layer = SampleNormalDistributionLayer(
+        config.theta_std_epsilon, name="fc_theta"
+    )
     fc_theta_norm_layer = NormalizationLayer(
         config.theta_normalization, name="fc_theta_norm"
     )
@@ -420,7 +486,7 @@ def _model_structure(config):
     #
 
     # Layers
-    means_layer = MeanVectorsLayer(
+    means_layer = VectorsLayer(
         config.n_modes,
         config.n_channels,
         config.learn_means,
@@ -433,14 +499,16 @@ def _model_structure(config):
         config.n_channels,
         config.learn_stds,
         config.initial_stds,
+        config.stds_epsilon,
         config.stds_regularizer,
         name="stds",
     )
     fcs_layer = CorrelationMatricesLayer(
-        config.n_modes,
+        config.n_fc_modes,
         config.n_channels,
         config.learn_fcs,
         config.initial_fcs,
+        config.fcs_epsilon,
         config.fcs_regularizer,
         name="fcs",
     )
@@ -448,7 +516,9 @@ def _model_structure(config):
     mix_stds_layer = MixMatricesLayer(name="mix_stds")
     mix_fcs_layer = MixMatricesLayer(name="mix_fcs")
     matmul_layer = MatMulLayer(name="cov")
-    ll_loss_layer = LogLikelihoodLossLayer(name="ll_loss")
+    ll_loss_layer = LogLikelihoodLossLayer(
+        np.maximum(config.stds_epsilon, config.fcs_epsilon), name="ll_loss"
+    )
 
     # Data flow
     mu = means_layer(inputs)  # inputs not used
@@ -476,6 +546,7 @@ def _model_structure(config):
         config.model_n_layers,
         config.model_n_units,
         config.model_dropout,
+        config.model_regularizer,
         name="mod_rnn",
     )
 
@@ -493,7 +564,7 @@ def _model_structure(config):
     mean_mod_sigma_layer = layers.Dense(
         config.n_modes, activation="softplus", name="mean_mod_sigma"
     )
-    kl_div_layer_mean = KLDivergenceLayer(name="mean_kl_div")
+    kl_div_layer_mean = KLDivergenceLayer(config.theta_std_epsilon, name="mean_kl_div")
 
     # Data flow
     mean_mod_mu = mean_mod_mu_layer(mod_rnn)
@@ -507,11 +578,11 @@ def _model_structure(config):
     #
 
     # Layers
-    fc_mod_mu_layer = layers.Dense(config.n_modes, name="fc_mod_mu")
+    fc_mod_mu_layer = layers.Dense(config.n_fc_modes, name="fc_mod_mu")
     fc_mod_sigma_layer = layers.Dense(
-        config.n_modes, activation="softplus", name="fc_mod_sigma"
+        config.n_fc_modes, activation="softplus", name="fc_mod_sigma"
     )
-    fc_kl_div_layer = KLDivergenceLayer(name="fc_kl_div")
+    fc_kl_div_layer = KLDivergenceLayer(config.theta_std_epsilon, name="fc_kl_div")
 
     # Data flow
     fc_mod_mu = fc_mod_mu_layer(mod_rnn)

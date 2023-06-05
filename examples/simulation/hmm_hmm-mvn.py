@@ -25,7 +25,7 @@ config = Config(
     batch_size=16,
     learning_rate=0.01,
     n_epochs=30,
-    learn_transprob=True,
+    learn_trans_prob=True,
 )
 
 # Simulate data
@@ -42,23 +42,15 @@ sim = simulation.HMM_MVN(
 )
 sim.standardize()
 
-# Use ground truth covariances as initialization
-config.initial_covariances = sim.covariances
-
 # Create training dataset
 training_data = data.Data(sim.time_series)
-training_dataset = training_data.dataset(
-    config.sequence_length,
-    config.batch_size,
-    shuffle=True,
-)
 
 # Build model
 model = Model(config)
 model.summary()
 
 # Train model
-history = model.fit(training_dataset)
+history = model.fit(training_data)
 
 # Loss
 plotting.plot_line(
@@ -69,23 +61,21 @@ plotting.plot_line(
     filename="figures/loss.png",
 )
 
-# Get inferred parameters
-prediction_dataset = training_data.dataset(
-    config.sequence_length,
-    config.batch_size,
-    shuffle=False,
-)
+# Calculate the free energy
+free_energy = model.free_energy(training_data)
+print("Free energy:", free_energy)
 
-inf_stc = model.get_alpha(prediction_dataset)
+# Get inferred parameters
+inf_stc = model.get_alpha(training_data)
 inf_means, inf_covs = model.get_means_covariances()
-inf_tp = model.get_transprob()
+inf_tp = model.get_trans_prob()
 
 # Re-order with respect to the simulation
 sim_stc = sim.mode_time_course
-orders = modes.match_modes(sim_stc, inf_stc, return_order=True)
-inf_stc = inf_stc[:, orders[1]]
-inf_covs = inf_covs[orders[1]]
-inf_tp = inf_tp[np.ix_(orders[1], orders[1])]
+_, order = modes.match_modes(sim_stc, inf_stc, return_order=True)
+inf_stc = inf_stc[:, order]
+inf_covs = inf_covs[order]
+inf_tp = inf_tp[np.ix_(order, order)]
 
 plotting.plot_alpha(
     sim_stc,
@@ -100,13 +90,10 @@ plotting.plot_matrices(
 )
 plotting.plot_matrices(inf_covs, main_title="Inferred", filename="figures/inf_covs.png")
 
-plotting.plot_matrices(inf_tp[np.newaxis, ...], filename="figures/transprob.png")
+plotting.plot_matrices(inf_tp[np.newaxis, ...], filename="figures/trans_prob.png")
 
 # Compare the inferred mode time course to the ground truth
 print("Dice coefficient:", metrics.dice_coefficient(sim_stc, inf_stc))
 
 print("Fractional occupancies (Simulation):", modes.fractional_occupancies(sim_stc))
 print("Fractional occupancies (Inferred):", modes.fractional_occupancies(inf_stc))
-
-# Delete temporary directory
-training_data.delete_dir()

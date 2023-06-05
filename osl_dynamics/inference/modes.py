@@ -2,61 +2,181 @@
 
 """
 
-import numpy as np
 from pathlib import Path
+
+import mne
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm.auto import trange
 from scipy.optimize import linear_sum_assignment
-from osl_dynamics import array_ops, analysis
+from scipy.cluster import hierarchy
+from sklearn.cluster import AgglomerativeClustering
+
+from osl_dynamics import analysis, array_ops
 from osl_dynamics.inference import metrics
+from osl_dynamics.utils import plotting
+from osl_dynamics.utils.misc import override_dict_defaults
 
 
-def time_courses(
-    alpha,
-    concatenate=False,
-    n_modes=None,
-):
-    """Calculates mode time courses.
-
-    Hard classifies the modes so that only one mode is active.
+def argmax_time_courses(alpha, concatenate=False, n_modes=None):
+    """Hard classifies a time course using an argmax operation.
 
     Parameters
     ----------
-    alpha : list, np.ndarray
-        Mode mixing factors with shape (n_subjects, n_samples, n_modes)
-        or (n_samples, n_modes).
+    alpha : list or np.ndarray
+        Mode mixing factors or state probabilities with shape
+        (n_subjects, n_samples, n_modes) or (n_samples, n_modes).
     concatenate : bool
-        If alpha is a list, should we concatenate the mode time course?
+        If alpha is a list, should we concatenate the time courses?
     n_modes : int
-        Number of modes there should be.
+        Number of modes/states there should be. Useful if there are
+        modes/states which never activate.
 
     Returns
     -------
-    stcs : list, np.ndarray
-        Mode time courses.
+    argmax_tcs : list or np.ndarray
+        Argmax time courses.
     """
     if isinstance(alpha, list):
         if n_modes is None:
             n_modes = alpha[0].shape[1]
-        stcs = [a.argmax(axis=1) for a in alpha]
-        stcs = [array_ops.get_one_hot(stc, n_states=n_modes) for stc in stcs]
-        if len(stcs) == 1:
-            stcs = stcs[0]
+        tcs = [a.argmax(axis=1) for a in alpha]
+        tcs = [array_ops.get_one_hot(tc, n_states=n_modes) for tc in tcs]
+        if len(tcs) == 1:
+            tcs = tcs[0]
         elif concatenate:
-            stcs = np.concatenate(stcs)
+            tcs = np.concatenate(tcs)
     elif alpha.ndim == 3:
         if n_modes is None:
             n_modes = alpha.shape[-1]
-        stcs = alpha.argmax(axis=2)
-        stcs = np.array([array_ops.get_one_hot(stc, n_states=n_modes) for stc in stcs])
-        if len(stcs) == 1:
-            stcs = stcs[0]
+        tcs = alpha.argmax(axis=2)
+        tcs = np.array([array_ops.get_one_hot(tc, n_states=n_modes) for tc in tcs])
+        if len(tcs) == 1:
+            tcs = tcs[0]
         elif concatenate:
-            stcs = np.concatenate(stcs)
+            tcs = np.concatenate(tcs)
     else:
         if n_modes is None:
             n_modes = alpha.shape[1]
-        stcs = alpha.argmax(axis=1)
-        stcs = array_ops.get_one_hot(stcs, n_states=n_modes)
-    return stcs
+        tcs = alpha.argmax(axis=1)
+        tcs = array_ops.get_one_hot(tcs, n_states=n_modes)
+    return tcs
+
+
+def gmm_time_courses(
+    alpha,
+    logit_transform=True,
+    standardize=True,
+    p_value=None,
+    filename=None,
+    sklearn_kwargs=None,
+    plot_kwargs={},
+):
+    """Fit a two component GMM to time courses to get a binary time course.
+
+    Parameters
+    ----------
+    alpha : list of np.ndarray or np.ndarray
+        Mode time courses.
+    logit_transform : bool
+        Should we logit transform the mode time course?
+    standardize : bool
+        Should we standardize the mode time course?
+    p_value : float
+        Used to determine a threshold. We ensure the data points assigned
+        to the 'on' component have a probability of less than p_value of
+        belonging to the 'off' component.
+    filename : str
+        Path to directory to plot the GMM fit plots.
+    sklearn_kwargs : dict
+        Keyword arguments for sklearn's GaussianMixture.
+    plot_kwargs : dict
+        Dictionary of keyword arguments to pass to
+        osl_dynamics.utils.plotting.plot_gmm().
+
+    Returns
+    -------
+    gmm_tcs : list of np.ndarray or np.ndarray
+        GMM time courses with binary entries.
+    """
+
+    if not isinstance(alpha, list):
+        alpha = [alpha]
+
+    n_subjects = len(alpha)
+    n_modes = alpha[0].shape[1]
+
+    gmm_tcs = []
+    gmm_metrics = []
+    for sub in trange(n_subjects, desc="Fitting GMMs"):
+        # Initialise an array to hold the gmm thresholded time course
+        gmm_tc = np.empty(alpha[sub].shape, dtype=int)
+        gmm_metric = []
+
+        # Loop over modes
+        for mode in range(n_modes):
+            a = alpha[sub][:, mode]
+
+            # Fit the GMM
+            default_sklearn_kwargs = {"max_iter": 5000, "n_init": 3}
+            sklearn_kwargs = override_dict_defaults(
+                default_sklearn_kwargs, sklearn_kwargs
+            )
+            threshold, metrics = analysis.gmm.fit_gaussian_mixture(
+                a,
+                logit_transform=logit_transform,
+                standardize=standardize,
+                p_value=p_value,
+                sklearn_kwargs=sklearn_kwargs,
+                return_statistics=True,
+                log_message=False,
+            )
+            gmm_tc[:, mode] = a > threshold
+            gmm_metric.append(metrics)
+
+        # Add to list containing subject-specific time courses and component metrics
+        gmm_tcs.append(gmm_tc)
+        gmm_metrics.append(gmm_metric)
+
+    # Visualise subject-specific time courses in one plot per mode
+    avg_threshold = [
+        np.mean([gmm_metrics[s][m]["threshold"] for s in range(n_subjects)])
+        for m in range(n_modes)
+    ]
+    if filename:
+        for mode in range(n_modes):
+            # GMM plot filename
+            if filename is not None:
+                plot_filename = "{fn.parent}/{fn.stem}{mode:0{w}d}{fn.suffix}".format(
+                    fn=Path(filename),
+                    mode=mode,
+                    w=len(str(n_modes)),
+                )
+            else:
+                plot_filename = None
+
+            # Subject-specific GMM plots per mode
+            fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(7, 4))
+            for sub in range(n_subjects):
+                metric = gmm_metrics[sub][mode]
+                plotting.plot_gmm(
+                    metric["data"],
+                    metric["amplitudes"],
+                    metric["means"],
+                    metric["stddevs"],
+                    legend_loc=None,
+                    ax=ax,
+                    **plot_kwargs,
+                )
+            ax.set_title(f"Averaged Threshold = {avg_threshold[mode]:.3}")
+            handles, labels = plt.gca().get_legend_handles_labels()
+            label_class = dict(zip(labels, handles))
+            ax.legend(label_class.values(), label_class.keys(), loc=1)
+            ax.axvline(avg_threshold[mode], color="black", linestyle="--")
+            plotting.save(fig, plot_filename)
+            plotting.close()
+
+    return gmm_tcs
 
 
 def correlate_modes(mode_time_course_1, mode_time_course_2):
@@ -135,8 +255,8 @@ def match_covariances(*covariances, comparison="rv_coefficient", return_order=Fa
                         covariances[i][k].flatten(), covariances[0][j].flatten()
                     )[0, 1]
                 else:
-                    F[j, k] = -metrics.rv_coefficient(
-                        [covariances[i][k], covariances[0][j]]
+                    F[j, k] = -metrics.pairwise_rv_coefficient(
+                        np.array([covariances[i][k], covariances[0][j]])
                     )[0, 1]
         order = linear_sum_assignment(F)[1]
 
@@ -192,55 +312,6 @@ def match_modes(*mode_time_courses, return_order=False):
         return matched_mode_time_courses
 
 
-def mode_activation(mode_time_course):
-    """Calculate mode activations for a mode time course.
-
-    Given a mode time course (strictly binary), calculate the beginning and end of each
-    activation of each mode.
-
-    Parameters
-    ----------
-    mode_time_course : numpy.ndarray
-        Mode time course (strictly binary).
-
-    Returns
-    -------
-    ons : list of numpy.ndarray
-        List containing mode beginnings in the order they occur for each mode.
-        This cannot necessarily be converted into an array as an equal number of
-        elements in each array is not guaranteed.
-    offs : list of numpy.ndarray
-        List containing mode ends in the order they occur for each mode.
-        This cannot necessarily be converted into an array as an equal number of
-        elements in each array is not guaranteed.
-    """
-    mode_on = []
-    mode_off = []
-
-    diffs = np.diff(mode_time_course, axis=0)
-    for i, diff in enumerate(diffs.T):
-        on = (diff == 1).nonzero()[0]
-        off = (diff == -1).nonzero()[0]
-        try:
-            if on[-1] > off[-1]:
-                off = np.append(off, len(diff))
-
-            if off[0] < on[0]:
-                on = np.insert(on, 0, -1)
-
-            mode_on.append(on)
-            mode_off.append(off)
-        except IndexError:
-            print(f"No activation in mode {i}.")
-            mode_on.append(np.array([]))
-            mode_off.append(np.array([]))
-
-    mode_on = np.array(mode_on, dtype=object)
-    mode_off = np.array(mode_off, dtype=object)
-
-    return mode_on, mode_off
-
-
 def reduce_mode_time_course(mode_time_course):
     """Remove empty modes from a mode time course.
 
@@ -259,234 +330,247 @@ def reduce_mode_time_course(mode_time_course):
     return mode_time_course[:, ~np.all(mode_time_course == 0, axis=0)]
 
 
-def lifetimes(mode_time_course, sampling_frequency=None):
-    """Calculate mode lifetimes for a mode time course.
-
-    Given a mode time course (one-hot encoded), calculate the lifetime of each
-    activation of each mode.
-
-    Parameters
-    ----------
-    mode_time_course : numpy.ndarray
-        Mode time course (strictly binary).
-    sampling_frequency : float
-        Sampling frequency in Hz. If passed returns the lifetimes in seconds.
-
-    Returns
-    -------
-    list of numpy.ndarray
-        List containing an array of lifetimes in the order they occur for each mode.
-        This cannot necessarily be converted into an array as an equal number of
-        elements in each array is not guaranteed.
-    """
-    if isinstance(mode_time_course, list):
-        mode_time_course = np.concatenate(mode_time_course)
-    ons, offs = mode_activation(mode_time_course)
-    lts = offs - ons
-    if sampling_frequency is not None:
-        lts = [lt / sampling_frequency for lt in lts]
-    return lts
+def fractional_occupancies(state_time_course):
+    """Wrapper for osl_dynamics.analysis.modes.fractional_occupancies."""
+    return analysis.modes.fractional_occupancies(state_time_course)
 
 
-def lifetime_statistics(mode_time_course, sampling_frequency=None):
-    """Calculate statistics of the lifetime distribution of each mode.
-
-    Parameters
-    ----------
-    mode_time_course : list or np.ndarray
-        Mode time course. Shape is (n_samples, n_modes).
-    sampling_frequency : float
-        Sampling frequency in Hz. If passed returns the lifetimes in seconds.
-
-    Returns
-    -------
-    means : np.ndarray
-        Mean lifetime of each mode.
-    std : np.ndarray
-        Standard deviation of each mode.
-    """
-    lts = lifetimes(mode_time_course, sampling_frequency)
-    mean = np.array([np.mean(lt) for lt in lts])
-    std = np.array([np.std(lt) for lt in lts])
-    return mean, std
+def mean_lifetimes(state_time_course, sampling_frequency=None):
+    """Wrapper for osl_dynamics.analysis.modes.mean_lifetimes."""
+    return analysis.modes.mean_lifetimes(state_time_course, sampling_frequency)
 
 
-def intervals(mode_time_course, sampling_frequency=None):
-    """Calculate mode intervals for a mode time course.
-
-    An interval is the duration between successive visits for a particular
-    mode.
-
-    Parameters
-    ----------
-    mode_time_course : list or numpy.ndarray
-        Mode time course (strictly binary).
-    sampling_frequency : float
-        Sampling frequency in Hz. If passed returns the intervals in seconds.
-
-    Returns
-    -------
-    intvs : list of numpy.ndarray
-        List containing an array of intervals in the order they occur for each mode.
-        This cannot necessarily be converted into an array as an equal number of
-        elements in each array is not guaranteed.
-    """
-    if isinstance(mode_time_course, list):
-        mode_time_course = np.concatenate(mode_time_course)
-    ons, offs = mode_activation(mode_time_course)
-    intvs = []
-    for on, off in zip(ons, offs):
-        intvs.append(on[1:] - off[:-1])
-    if sampling_frequency is not None:
-        intvs = [intv / sampling_frequency for intv in intvs]
-    return intvs
+def mean_intervals(state_time_course, sampling_frequency=None):
+    """Wrapper for osl_dynamics.analysis.modes.mean_intervals."""
+    return analysis.modes.mean_intervals(state_time_course, sampling_frequency)
 
 
-def fractional_occupancies(mode_time_course):
-    """Calculates the fractional occupancy.
-
-    Parameters
-    ----------
-    mode_time_course : list or np.ndarray
-        Mode time course. Shape is (n_samples, n_modes).
-
-    Returns
-    -------
-    fo : np.ndarray
-        The fractional occupancy of each mode.
-    """
-    if isinstance(mode_time_course, list):
-        fo = [np.sum(mtc, axis=0) / mtc.shape[0] for mtc in mode_time_course]
-    else:
-        fo = np.sum(mode_time_course, axis=0) / mode_time_course.shape[0]
-    return fo
+def switching_rates(state_time_course, sampling_frequency=None):
+    """Wrapper for osl_dynamics.analysis.modes.switching_rates."""
+    return analysis.modes.switching_rates(state_time_course, sampling_frequency)
 
 
-def fano_factor(
-    time_courses,
-    window_lengths,
-    sampling_frequency=1.0,
+def convert_to_mne_raw(
+    alpha,
+    raw,
+    ch_names=None,
+    n_embeddings=None,
+    n_window=None,
+    extra_chans="stim",
+    verbose=False,
 ):
-    """Calculates the FANO factor.
+    """Convert a time series to an MNE Raw object.
 
     Parameters
     ----------
-    time_courses : list or np.ndarray
-        State/mode activation time courses.
-    window_lengths : list or np.ndarray
-        Window lengths to use.
-    sampling_frequency : float
-        Sampling frequency of the time courses.
+    alpha : np.ndarray
+        Time series containing raw data. Shape must be (n_samples, n_modes).
+    raw : mne.io.Raw or str
+        MNE Raw object to extract info from. If a str is passed, it must be the
+        path to a fif file containing the Raw object.
+    ch_names : list
+        Name for each channel. Optional. Defaults to alpha_0...alpha_{n_modes-1}.
+    n_embeddings : int
+        Number of embeddings that was used to prepare time-delay embedded
+        training data. Optional.
+    n_window : int
+        Number of samples used to smooth amplitude envelope data. Optional.
+    extra_chans : str or list of str
+        Extra channel types to add to the Raw object.
+    verbose : bool
+        Should we print a verbose?
 
     Returns
     -------
-    F : list of np.ndarray
-        FANO factor.
+    alpha_raw : mne.io.Raw
+        Raw object for alpha.
     """
-    if isinstance(time_courses, np.ndarray):
-        time_courses = [time_courses]
+    # Validation
+    if extra_chans is None:
+        extra_chans = []
+    if isinstance(extra_chans, str):
+        extra_chans = [extra_chans]
 
-    # Loop through subjects
-    F = []
-    for subject in time_courses:
-        n_samples = subject.shape[0]
-        n_modes = subject.shape[1]
-        F.append([])
+    # How many time points from the start of parcellated data should we remove?
+    if n_embeddings is not None and n_window is not None:
+        raise ValueError("Cannot pass both n_embeddings and n_window.")
+    n_trim = n_embeddings or n_window or 1
+    n_trim = n_trim // 2
 
-        # Loop through window lengths
-        for window_length in window_lengths:
-            w = int(window_length * sampling_frequency)
-            n_windows = n_samples // w
-            tc = subject[: n_windows * w]
-            tc = tc.reshape(n_windows, w, n_modes)
+    # Load the Raw object
+    if isinstance(raw, str):
+        raw = mne.io.read_raw_fif(raw, verbose=verbose)
 
-            # Loop through windows
-            counts = []
-            for window in tc:
+    # Get time indices excluding bad segments from raw
+    _, times = raw.get_data(
+        reject_by_annotation="omit", return_times=True, verbose=verbose
+    )
+    indices = raw.time_as_index(times)
 
-                # Number of activations
-                d = np.diff(window, axis=0)
-                c = []
-                for i in range(n_modes):
-                    c.append(len(d[:, i][d[:, i] == 1]))
-                counts.append(c)
+    # Remove time points lost due to time delay embedding
+    indices = indices[n_trim:]
 
-            # Calculate FANO factor
-            counts = np.array(counts)
-            F[-1].append(np.std(counts, axis=0) ** 2 / np.mean(counts, axis=0))
+    # Create an array for the full time series including bad segments
+    n_samples = raw.times.shape[0]
+    n_channels = alpha.shape[1]
+    alpha_ = np.zeros([n_samples, n_channels], dtype=np.float32)
 
-    return np.squeeze(F)
+    # Trim the indices we lost when we separate the time series into sequences
+    indices = indices[: alpha.shape[0]]
 
+    # Fill in the value for the time series for non-bad segments
+    alpha_[indices] = alpha
 
-def gmm_per_subject(time_course, time_course_type, gmm_filename=None):
-    """Fit a 2 component GMM to a subject specific time course.
-
-    Parameters
-    ----------
-    time_course : np.ndarray
-        Time course to be fitted with GMM. Shape is (n_samples, n_modes)
-    time_course_type : str
-        Name of the time course. (e.g. alpha/gamma)
-    gmm_filename : str
-        Path to directory to store the GMM fit plots.
-
-    Returns
-    -------
-    time_course : np.ndarray
-        Time course in which activations are determined by fitting GMM.
-    """
-    n_modes = time_course.shape[1]
-
-    # loop over modes
-    for j in range(n_modes):
-        a = time_course[:, j]
-        a[np.isinf(a)] = np.mean(a[~np.isinf(a)])
-
-        # fit a 2 component GMM
-        if gmm_filename is not None:
-            plot_filename = "{fn.parent}/{fn.stem}/{fn.stem}_{time_course_type}_{j:0{w2}d}{fn.suffix}".format(
-                fn=Path(gmm_filename),
-                time_course_type=time_course_type,
-                j=j,
-                w2=len(str(n_modes)),
-            )
-        else:
-            plot_filename = None
-        mixture_label = analysis.gmm.fit_gaussian_mixture(
-            a,
-            print_message=False,
-            plot_filename=plot_filename,
-            bayesian=False,
-            max_iter=5000,
-            n_init=5,
-        )
-        time_course[:, j] = np.array(mixture_label)
-    return time_course
-
-
-def gmm_for_time_course(time_course, time_course_type, gmm_filename=None):
-    """Fit GMM to time course
-
-    Parameters
-    ----------
-    time_course : List of np.ndarray
-        List of time courses per subject.
-    time_course_type : str
-        Name of the time course (e.g. alpha/gamma).
-    gmm_filename : str
-        Path to directory to store the GMM fit plots.
-
-    Returns
-    -------
-    time_courses : list of np.ndarray
-        List of time courses in which activations are determined by fitting GMM.
-    """
-    # extract the positions of discontinuities
-    discontinuities = [mtc.shape[0] for mtc in time_course]
-
-    # gmm fit to the concatenated time course across subjects
-    time_course = gmm_per_subject(
-        np.concatenate(time_course), time_course_type, gmm_filename=gmm_filename
+    # Create info object
+    if ch_names is None:
+        ch_names = [f"alpha_{ch}" for ch in range(n_channels)]
+    alpha_info = mne.create_info(
+        ch_names=ch_names, ch_types="misc", sfreq=raw.info["sfreq"], verbose=verbose
     )
 
-    return np.split(time_course, np.cumsum(discontinuities))
+    # Create Raw object
+    alpha_raw = mne.io.RawArray(alpha_.T, alpha_info, verbose=verbose)
+
+    # Copy timing info
+    alpha_raw.set_meas_date(raw.info["meas_date"])
+    alpha_raw.__dict__["_first_samps"] = raw.__dict__["_first_samps"]
+    alpha_raw.__dict__["_last_samps"] = raw.__dict__["_last_samps"]
+    alpha_raw.__dict__["_cropped_samp"] = raw.__dict__["_cropped_samp"]
+
+    # Copy annotations from raw
+    alpha_raw.set_annotations(raw._annotations)
+
+    # Add extra channels
+    for extra_chan in extra_chans:
+        if extra_chan in raw:
+            chan_raw = raw.copy().pick(extra_chan)
+            chan_data = chan_raw.get_data()
+            chan_info = mne.create_info(
+                chan_raw.ch_names,
+                raw.info["sfreq"],
+                [extra_chan] * chan_data.shape[0],
+            )
+            chan_raw = mne.io.RawArray(chan_data, chan_info, verbose=verbose)
+            alpha_raw.add_channels([chan_raw], force_update_info=True)
+
+    return alpha_raw
+
+
+def reweight_alphas(alpha, covs):
+    """Re-weight DyNeMo mixing coefficients to account for the magnitude of
+    the mode covariances.
+
+    Parameters
+    ----------
+    alpha : list of np.ndarray or np.ndarray
+        Raw alphas from DyNeMo. Shape must be (n_subjects, n_samples, n_modes)
+        or (n_samples, n_modes).
+    covs : np.ndarray
+        Mode covariances. Shape must be (n_modes, n_channels, n_channels).
+
+    Returns
+    -------
+    reweighted_alpha : list of np.ndarray or np.ndarray
+        Re-weighted alphas. Shape is the same as alpha.
+    """
+    if isinstance(alpha, np.ndarray):
+        alpha = [alpha]
+
+    # Calculate normalised alphas
+    traces = np.trace(covs, axis1=1, axis2=2)
+    reweighted_alpha = [a * traces[np.newaxis, :] for a in alpha]
+    reweighted_alpha = [
+        na / np.sum(na, axis=1, keepdims=True) for na in reweighted_alpha
+    ]
+
+    if len(reweighted_alpha) == 1:
+        reweighted_alpha = reweighted_alpha[0]
+
+    return reweighted_alpha
+
+
+def average_runs(alpha, n_clusters=None, return_cluster_info=False):
+    """Average the state probabilities from different runs using hierarchical
+    clustering.
+
+    The hierarchical clustering used in this function is described `here
+    <https://www.biorxiv.org/content/10.1101/2023.01.18.524539v2>`_.
+
+    Parameters
+    ----------
+    alpha : list of list of np.ndarray or list of np.ndarray
+        State probabilities. Shape must be (n_runs, n_subjects, n_samples, n_states)
+        or (n_runs, n_samples, n_states).
+    n_clusters : int
+        Number of clusters to fit. Optional. Defaults to the largest number of
+        states in alpha.
+    return_cluster_info : bool
+        Should we return information describing the clustering?
+
+    Returns
+    -------
+    average_alpha : list of np.ndarray or np.ndarray
+        State probabilities averaged over runs. Shape is (n_subjects, n_states).
+    cluster_info : dict
+        Clustering info. Only returned if return_cluster_info=True.
+        This is a dictionary with keys 'correlation', 'dissimiarity', 'ids' and
+        'linkage'.
+    """
+    if not isinstance(alpha, list):
+        raise ValueError(
+            "alpha must be a list of lists (of numpy arrays) or list of numpy arrays."
+        )
+    if isinstance(alpha[0], np.ndarray):
+        alpha = [[a] for a in alpha]
+
+    # Number of runs and length of each subject's data
+    n_runs = len(alpha)
+    n_subject_samples = [a.shape[0] for a in alpha[0]]
+
+    # Use the largest number of states as the number of clusters to find
+    if n_clusters is None:
+        n_clusters = max([a.shape[-1] for a in alpha[0]])
+
+    # Concatenate over subjects, gives (n_runs, n_samples, n_states) array
+    alpha = [np.concatenate(a, axis=0) for a in alpha]
+
+    # Turn into a (n_runs * n_states, n_samples) array
+    alpha_ = []
+    for i in range(n_runs):
+        for j in range(alpha[i].shape[-1]):
+            alpha_.append(alpha[i][:, j])
+    alpha = np.array(alpha_, dtype=np.float32).T
+
+    # Calculate correlation between all pairwise state probability time courses
+    corr = np.corrcoef(alpha, rowvar=False)
+
+    # Convert correlation to a dis-similarity measure
+    dissimilarity = 1 - corr
+
+    # Hierarchical clustering
+    clustering = AgglomerativeClustering(n_clusters, linkage="ward")
+    cluster_ids = clustering.fit_predict(dissimilarity)
+
+    # Average alphas in each cluster
+    average_alpha = []
+    for i in range(n_clusters):
+        a = np.mean(alpha[:, cluster_ids == i], axis=-1)
+        average_alpha.append(a)
+    average_alpha = np.array(average_alpha, dtype=np.float32).T
+
+    # Split average alphas back into subject-specific time courses
+    average_alpha = np.split(average_alpha, np.cumsum(n_subject_samples[:-1]))
+
+    if return_cluster_info:
+        # Create a dictionary containing the clustering info
+        linkage = hierarchy.linkage(dissimilarity, method="ward")
+        cluster_info = {
+            "correlation": corr,
+            "dissimilarity": dissimilarity,
+            "ids": cluster_ids,
+            "linkage": linkage,
+        }
+        return average_alpha, cluster_info
+
+    else:
+        return average_alpha

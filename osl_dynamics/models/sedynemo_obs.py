@@ -7,27 +7,26 @@ from dataclasses import dataclass
 import numpy as np
 import tensorflow as tf
 from tensorflow_probability import bijectors as tfb
-from tensorflow.keras import layers
+from tensorflow.keras import layers, initializers
 
 import osl_dynamics.data.tf as dtf
 from osl_dynamics.models import dynemo_obs
 from osl_dynamics.models.mod_base import BaseModelConfig, ModelBase
-from osl_dynamics.inference import regularizers
 from osl_dynamics.inference.layers import (
-    DummyLayer,
     LogLikelihoodLossLayer,
-    MeanVectorsLayer,
+    LearnableTensorLayer,
+    VectorsLayer,
     CovarianceMatricesLayer,
-    SubjectDevEmbeddingLayer,
+    ConcatEmbeddingsLayer,
     SubjectMapLayer,
-    MixSubjectEmbeddingParametersLayer,
+    MixSubjectSpecificParametersLayer,
     TFRangeLayer,
     ZeroLayer,
     InverseCholeskyLayer,
-    SampleNormalDistributionLayer,
-    ScalarLayer,
-    SubjectMapKLDivergenceLayer,
+    SampleGammaDistributionLayer,
+    StaticKLDivergenceLayer,
     KLLossLayer,
+    MultiLayerPerceptronLayer,
 )
 
 
@@ -37,6 +36,8 @@ class Config(BaseModelConfig):
 
     Parameters
     ----------
+    model_name : str
+        Model name.
     n_modes : int
         Number of modes.
     n_channels : int
@@ -51,6 +52,8 @@ class Config(BaseModelConfig):
         Initialisation for mean vectors.
     initial_covariances : np.ndarray
         Initialisation for mode covariances.
+    covariances_epsilon : float
+        Error added to mode covariances for numerical stability.
     means_regularizer : tf.keras.regularizers.Regularizer
         Regularizer for group mean vectors.
     covariances_regularizer : tf.keras.regularizers.Regularizer
@@ -58,24 +61,28 @@ class Config(BaseModelConfig):
 
     n_subjects : int
         Number of subjects.
-    subject_embedding_dim : int
-        Number of dimensions for the subject embedding.
-    mode_embedding_dim : int
-        Number of dimensions for the mode embedding in the spatial maps encoder.
-    mode_embedding_activation : str
-        Activation of the mode encoders.
-    dev_reg : str
-        Type of regularisation applied to the deviations.
-    dev_reg_strength : float
-        Strength of regularisation to deviations.
-    dev_bayesian : bool
-        Do we want to be fully Bayesian on deviations?.
-    learn_dev_mod_sigma : bool
-        Do we want to learn the prior std of the deviation.
-    initial_dev_mod_sigma : float
-        Initial value for prior std of the deviation.
-    do_kl_annealing : bool
-        Should we do annealing on the KL loss during training?
+    subject_embeddings_dim : int
+        Number of dimensions for the subject embeddings.
+    mode_embeddings_dim : int
+        Number of dimensions for the mode embeddings in the spatial maps encoder.
+
+    dev_n_layers : int
+        Number of layers for the MLP for deviations.
+    dev_n_units : int
+        Number of units for the MLP for deviations.
+    dev_normalization : str
+        Type of normalization for the MLP for deviations.
+        Either None, 'batch' or 'layer'.
+    dev_activation : str
+        Type of activation to use for the MLP for deviations.
+        E.g. 'relu', 'sigmoid', 'tanh', etc.
+    dev_dropout : float
+        Dropout rate for the MLP for deviations.
+    dev_regularizer : str
+        Regularizer for the MLP for deviations.
+    dev_regularizer_factor : float
+        Regularizer factor for the MLP for deviations.
+        This will be scaled by the amount of data.
 
     batch_size : int
         Mini-batch size.
@@ -94,25 +101,29 @@ class Config(BaseModelConfig):
         Strategy for distributed learning.
     """
 
+    model_name: str = "SE-DyNeMo-Obs"
+
     # Observation model parameters
     learn_means: bool = None
     learn_covariances: bool = None
     initial_means: np.ndarray = None
     initial_covariances: np.ndarray = None
+    covariances_epsilon: float = None
     means_regularizer: tf.keras.regularizers.Regularizer = None
     covariances_regularizer: tf.keras.regularizers.Regularizer = None
 
     # Parameters specific to subject embedding model
     n_subjects: int = None
-    subject_embedding_dim: int = None
-    mode_embedding_dim: int = None
-    mode_embedding_activation: str = None
-    dev_reg: str = None
-    dev_reg_strength: float = 0.0
-    dev_bayesian: bool = False
-    learn_dev_mod_sigma: bool = True
-    initial_dev_mod_sigma: float = 1
-    do_kl_annealing: bool = False
+    subject_embeddings_dim: int = None
+    mode_embeddings_dim: int = None
+
+    dev_n_layers: int = 0
+    dev_n_units: int = None
+    dev_normalization: str = None
+    dev_activation: str = None
+    dev_dropout: float = 0.0
+    dev_regularizer: str = None
+    dev_regularizer_factor: float = 0.0
 
     def __post_init__(self):
         self.validate_observation_model_parameters()
@@ -124,28 +135,65 @@ class Config(BaseModelConfig):
         if self.learn_means is None or self.learn_covariances is None:
             raise ValueError("learn_means and learn_covariances must be passed.")
 
+        if self.covariances_epsilon is None:
+            if self.learn_covariances:
+                self.covariances_epsilon = 1e-6
+            else:
+                self.covariances_epsilon = 0.0
+
     def validate_subject_embedding_parameters(self):
         if (
             self.n_subjects is None
-            or self.subject_embedding_dim is None
-            or self.mode_embedding_dim is None
+            or self.subject_embeddings_dim is None
+            or self.mode_embeddings_dim is None
         ):
             raise ValueError(
-                "n_subjects, subject_embedding_dim and mode_embedding_dim must be passed."
+                "n_subjects, subject_embeddings_dim and mode_embeddings_dim must be passed."
             )
+
+        if self.dev_n_layers != 0 and self.dev_n_units is None:
+            raise ValueError("Please pass dev_inf_n_units.")
 
 
 class Model(ModelBase):
-    """SE-DyNeMo observation model class.
+    """Observation model for directional SE-DyNeMo
 
     Parameters
     ----------
-    config : osl_dynamics.models.dynemo_obs.Config
+    config : osl_dynamics.models.sedynemo_obs.Config
     """
+
+    config_type = Config
 
     def build_model(self):
         """Builds a keras model."""
         self.model = _model_structure(self.config)
+
+    def fit(self, training_data, *arg, **kwargs):
+        # Set the scalings
+        self.set_dev_mlp_reg_scaling(training_data)
+        self.set_bayesian_kl_scaling(training_data)
+        return super().fit(training_data, *args, **kwargs)
+
+    def get_group_means(self):
+        """Get the group means.
+
+        Returns
+        -------
+        means : np.ndarray
+            Group means. Shape is (n_modes, n_channels).
+        """
+        return dynemo_obs.get_means(self.model, "group_means")
+
+    def get_group_covariances(self):
+        """Get the group covariances.
+
+        Returns
+        -------
+        covariances : np.ndarray
+            Group covariances. Shape is (n_modes, n_channels, n_channels).
+        """
+        return dynemo_obs.get_covariances(self.model, "group_covs")
 
     def get_group_means_covariances(self):
         """Get the group means and covariances of each mode.
@@ -165,51 +213,19 @@ class Model(ModelBase):
         Returns
         -------
         subject_embeddings : np.ndarray
-            Embedding vectors for subjects. Shape is (n_subjects, subject_embedding_dim).
+            Embedding vectors for subjects. Shape is (n_subjects, subject_embeddings_dim).
         """
         return get_subject_embeddings(self.model)
 
-    def get_mode_embeddings(self):
-        """Get the mode spatial map embeddings.
+    def get_subject_means_covariances(self, subject_embeddings=None, n_neighbours=2):
+        """Get the means and covariances for each subject.
 
-        Returns
-        -------
-        means_mode_embeddings : np.ndarray
-            Mode embeddings for means. Shape is (n_modes, mode_embedding_dim).
-        covs_mode_embeddings : np.ndarray
-            Mode embeddings for covs. Shape is (n_modes, mode_embedding_dim).
-        """
-        return get_mode_embeddings(self.model)
-
-    def get_concatenated_embeddings(self):
-        """Get the concatenated embedding vectors of deviations.
-
-        Returns
-        -------
-        means_embedding : np.ndarray
-            Embedding vectors for the mean deviations.
-            Shape is (n_subjects, n_modes, subject_embedding_dim + mode_embedding_dim).
-        covs_embedding : np.ndarray
-            Embedding vectors for the covs deviations.
-            Shape is (n_subjects, n_modes, subject_embedding_dim + mode_embedding_dim).
-        """
-        return get_concatenated_embeddings(self.model)
-
-    def get_subject_dev(self):
-        """Get the subject specific deviations of means and covs from the group.
-
-        Returns
-        -------
-        means_dev : np.ndarray
-            Deviation of means from the group. Shape is (n_subjects, n_modes, n_channels).
-        covs_dev : np.ndarray
-            Deviation of Cholesky factor of covs from the group.
-            Shaoe is (n_subjects, n_modes, n_channels * (n_channels + 1) // 2).
-        """
-        return get_subject_dev(self.model, self.config.dev_bayesian)
-
-    def get_subject_means_covariances(self):
-        """Get the means and covariances for each subject
+        Parameters
+        ----------
+        subject_embeddings : np.ndarray
+            Input embedding vectors for subjects. Shape is (n_subjects, subject_embeddings_dim).
+        n_neighbours : int
+            Number of nearest neighbours. Ignored if subject_embedding=None.
 
         Returns
         -------
@@ -218,20 +234,28 @@ class Model(ModelBase):
         subject_covs : np.ndarray
             Mode covariances for each subject. Shape is (n_subjects, n_modes, n_channels, n_channels).
         """
-        return get_subject_means_covariances(self.model, self.config.dev_bayesian)
+        return get_subject_means_covariances(
+            self.model,
+            self.config.learn_means,
+            self.config.learn_covariances,
+            subject_embeddings,
+            n_neighbours,
+        )
 
     def set_regularizers(self, training_dataset):
         """Set the means and covariances regularizer based on the training data.
 
         A multivariate normal prior is applied to the mean vectors with mu = 0,
         sigma=diag((range / 2)**2) and an inverse Wishart prior is applied to the
-        covariances matrices with nu=n_channels - 1 + 0.1 and psi=diag(1 / range).
+        covariances matrices with nu=n_channels - 1 + 0.1 and psi=diag(range).
 
         Parameters
         ----------
         training_data : tensorflow.data.Dataset
             Training dataset.
         """
+        training_dataset = self.make_dataset(training_dataset, concatenate=True)
+
         if self.config.learn_means:
             dynemo_obs.set_means_regularizer(
                 self.model, training_dataset, layer_name="group_means"
@@ -239,15 +263,57 @@ class Model(ModelBase):
 
         if self.config.learn_covariances:
             dynemo_obs.set_covariances_regularizer(
-                self.model, training_dataset, layer_name="group_covs"
+                self.model,
+                training_dataset,
+                self.config.covariances_epsilon,
+                layer_name="group_covs",
             )
 
-    def set_bayesian_deviation_parameters(self, training_dataset):
+    def set_bayesian_kl_scaling(self, training_dataset):
         """Set the correct scaling for KL loss between deviation posterior and prior."""
         n_batches = dtf.get_n_batches(training_dataset)
         learn_means = self.config.learn_means
         learn_covariances = self.config.learn_covariances
         set_bayesian_kl_scaling(self.model, n_batches, learn_means, learn_covariances)
+
+    def set_dev_mlp_reg_scaling(self, training_dataset):
+        """Set the correct scaling for the dev mlp regularization."""
+        n_batches = dtf.get_n_batches(training_dataset)
+        learn_means = self.config.learn_means
+        learn_covariances = self.config.learn_covariances
+        set_dev_mlp_reg_scaling(self.model, n_batches, learn_means, learn_covariances)
+
+    def set_group_means(self, group_means, update_initializer=True):
+        """Set the group means of each mode.
+
+        Parameters
+        ----------
+        group_means : np.ndarray
+            Mode means.
+        update_initializer : bool
+            Do we want to use the passed group means when we re-initialize the model?
+        """
+        dynemo_obs.set_means(
+            self.model, group_means, update_initializer, layer_name="group_means"
+        )
+
+    def set_group_covariances(self, group_covariances, update_initializer=True):
+        """Set the group covariances of each mode.
+
+        Parameters
+        ----------
+        group_covariances : np.ndarray
+            Mode covariances.
+        update_initializer : bool
+            Do we want to use the passed group covariances when we re-initialize
+            the model?
+        """
+        dynemo_obs.set_covariances(
+            self.model,
+            group_covariances,
+            update_initializer=update_initializer,
+            layer_name="group_covs",
+        )
 
 
 def _model_structure(config):
@@ -256,23 +322,14 @@ def _model_structure(config):
     alpha = layers.Input(shape=(config.sequence_length, config.n_modes), name="alpha")
     subj_id = layers.Input(shape=(config.sequence_length,), name="subj_id")
 
-    # Observation model:
-    # - We use a multivariate normal with a mean vector and covariance matrix for
-    #   each mode as the observation model.
-    # - Each subject has their own mean vectors and covariance matrices for each mode.
-    #   They are near the group means and covariances.
-    # - We calculate the likelihood of generating the training data with alpha
-    #   and the observation model.
-
-    # Definition of layers
-
-    # Subject embedding layer
+    # Subject embedding layers
     subjects_layer = TFRangeLayer(config.n_subjects, name="subjects")
-    subject_embedding_layer = layers.Embedding(
-        config.n_subjects, config.subject_embedding_dim, name="subject_embeddings"
+    subject_embeddings_layer = layers.Embedding(
+        config.n_subjects, config.subject_embeddings_dim, name="subject_embeddings"
     )
 
-    group_means_layer = MeanVectorsLayer(
+    # Group level observation model parameters
+    group_means_layer = VectorsLayer(
         config.n_modes,
         config.n_channels,
         config.learn_means,
@@ -285,268 +342,448 @@ def _model_structure(config):
         config.n_channels,
         config.learn_covariances,
         config.initial_covariances,
+        config.covariances_epsilon,
         config.covariances_regularizer,
         name="group_covs",
     )
-    means_mode_embedding_layer = layers.Dense(
-        config.mode_embedding_dim,
-        config.mode_embedding_activation,
-        name="means_mode_embedding",
-    )
-    covs_mode_embedding_layer = layers.Dense(
-        config.mode_embedding_dim,
-        config.mode_embedding_activation,
-        name="covs_mode_embedding",
-    )
-    means_concat_embedding_layer = SubjectDevEmbeddingLayer(
-        config.n_modes,
-        config.n_channels,
-        config.n_subjects,
-        name="means_concat_embedding",
-    )
-    covs_concat_embedding_layer = SubjectDevEmbeddingLayer(
-        config.n_modes,
-        config.n_channels,
-        config.n_subjects,
-        name="covs_concat_embedding",
-    )
-    # ----------------------------------------- #
-    # Layers specific to the non Bayesian model #
-    # ----------------------------------------- #
-    if not config.dev_bayesian:
-        if config.learn_means:
-            means_dev_layer = layers.Dense(config.n_channels, name="means_dev")
-        else:
-            means_dev_layer = ZeroLayer(
-                shape=(config.n_subjects, config.n_modes, config.n_channels),
-                name="means_dev",
-            )
 
-        if config.learn_covariances:
-            covs_dev_layer = layers.Dense(
-                config.n_channels * (config.n_channels + 1) // 2,
-                name="covs_dev",
-            )
-        else:
-            covs_dev_layer = ZeroLayer(
-                shape=(
-                    config.n_subjects,
-                    config.n_modes,
-                    config.n_channels * (config.n_channels + 1) // 2,
-                ),
-                name="covs_dev",
-            )
+    subjects = subjects_layer(data)
+    subject_embeddings = subject_embeddings_layer(subjects)
 
-        means_dev_reg_layer = DummyLayer(
-            config.dev_reg,
-            config.dev_reg_strength,
-            name="means_dev_reg",
+    group_mu = group_means_layer(data)
+    group_D = group_covs_layer(data)
+
+    # ---------------
+    # Mean deviations
+
+    # Layer definitions
+    if config.learn_means:
+        means_mode_embeddings_layer = layers.Dense(
+            config.mode_embeddings_dim,
+            name="means_mode_embeddings",
         )
-        covs_dev_reg_layer = DummyLayer(
-            config.dev_reg,
-            config.dev_reg_strength,
-            name="covs_dev_reg",
+        means_concat_embeddings_layer = ConcatEmbeddingsLayer(
+            name="means_concat_embeddings",
         )
-    # ------------------------------------- #
-    # Layers specific to the Bayesian model #
-    # ------------------------------------- #
+
+        means_dev_map_input_layer = MultiLayerPerceptronLayer(
+            config.dev_n_layers,
+            config.dev_n_units,
+            config.dev_normalization,
+            config.dev_activation,
+            config.dev_dropout,
+            config.dev_regularizer,
+            config.dev_regularizer_factor,
+            name="means_dev_map_input",
+        )
+        means_dev_map_layer = layers.Dense(config.n_channels, name="means_dev_map")
+        norm_means_dev_map_layer = layers.LayerNormalization(
+            axis=-1, name="norm_means_dev_map"
+        )
+
+        means_dev_mag_inf_alpha_input_layer = LearnableTensorLayer(
+            shape=(config.n_subjects, config.n_modes, 1),
+            learn=config.learn_means,
+            initializer=initializers.TruncatedNormal(mean=0, stddev=0.02),
+            name="means_dev_mag_inf_alpha_input",
+        )
+        means_dev_mag_inf_alpha_layer = layers.Activation(
+            "softplus", name="means_dev_mag_inf_alpha"
+        )
+        means_dev_mag_inf_beta_input_layer = LearnableTensorLayer(
+            shape=(config.n_subjects, config.n_modes, 1),
+            learn=config.learn_means,
+            initializer=initializers.TruncatedNormal(mean=0, stddev=0.02),
+            name="means_dev_mag_inf_beta_input",
+        )
+        means_dev_mag_inf_beta_layer = layers.Activation(
+            "softplus", name="means_dev_mag_inf_beta"
+        )
+        means_dev_mag_layer = SampleGammaDistributionLayer(
+            config.covariances_epsilon, name="means_dev_mag"
+        )
+
+        means_dev_layer = layers.Multiply(name="means_dev")
+
+        # Data flow to get the subject specific deviations of means
+
+        # Get the concatenated embeddings
+        means_mode_embeddings = means_mode_embeddings_layer(group_mu)
+        means_concat_embeddings = means_concat_embeddings_layer(
+            [subject_embeddings, means_mode_embeddings]
+        )
+
+        # Get the mean deviation maps (no global magnitude information)
+        means_dev_map_input = means_dev_map_input_layer(means_concat_embeddings)
+        means_dev_map = means_dev_map_layer(means_dev_map_input)
+        norm_means_dev_map = norm_means_dev_map_layer(means_dev_map)
+
+        # Get the deviation magnitudes (scale deviation maps globally)
+
+        means_dev_mag_inf_alpha_input = means_dev_mag_inf_alpha_input_layer(data)
+        means_dev_mag_inf_alpha = means_dev_mag_inf_alpha_layer(
+            means_dev_mag_inf_alpha_input
+        )
+        means_dev_mag_inf_beta_input = means_dev_mag_inf_beta_input_layer(data)
+        means_dev_mag_inf_beta = means_dev_mag_inf_beta_layer(
+            means_dev_mag_inf_beta_input
+        )
+        means_dev_mag = means_dev_mag_layer(
+            [means_dev_mag_inf_alpha, means_dev_mag_inf_beta]
+        )
+        means_dev = means_dev_layer([means_dev_mag, norm_means_dev_map])
     else:
-        means_dev_inf_mu_layer = layers.Dense(
-            config.n_channels, name="means_dev_inf_mu"
+        means_dev_layer = ZeroLayer(
+            shape=(config.n_subjects, config.n_modes, config.n_channels),
+            name="means_dev",
         )
-        means_dev_inf_sigma_layer = layers.Dense(
-            config.n_channels, activation="softplus", name="means_dev_inf_sigma"
-        )
-        if config.learn_means:
-            means_dev_layer = SampleNormalDistributionLayer(name="means_dev")
-        else:
-            means_dev_layer = ZeroLayer(
-                shape=(config.n_subjects, config.n_modes, config.n_channels),
-                name="means_dev",
-            )
+        means_dev = means_dev_layer(data)
 
-        covs_dev_inf_mu_layer = layers.Dense(
-            config.n_channels * (config.n_channels + 1) // 2, name="covs_dev_inf_mu"
-        )
-        covs_dev_inf_sigma_layer = layers.Dense(
-            config.n_channels * (config.n_channels + 1) // 2,
-            activation="softplus",
-            name="covs_dev_inf_sigma",
-        )
-        if config.learn_covariances:
-            covs_dev_layer = SampleNormalDistributionLayer(name="covs_dev")
-        else:
-            covs_dev_layer = ZeroLayer(
-                shape=(
-                    config.n_subjects,
-                    config.n_modes,
-                    config.n_channels * (config.n_channels + 1) // 2,
-                ),
-                name="covs_dev",
-            )
+    # ----------------------
+    # Covariances deviations
 
-    subject_means_layer = SubjectMapLayer("means", name="subject_means")
-    subject_covs_layer = SubjectMapLayer("covariances", name="subject_covs")
-    mix_subject_means_covs_layer = MixSubjectEmbeddingParametersLayer(
-        name="mix_subject_means_covs"
+    # Layer definitions
+    if config.learn_covariances:
+        covs_mode_embeddings_layer = layers.Dense(
+            config.mode_embeddings_dim,
+            name="covs_mode_embeddings",
+        )
+        covs_concat_embeddings_layer = ConcatEmbeddingsLayer(
+            name="covs_concat_embeddings",
+        )
+
+        covs_dev_map_input_layer = MultiLayerPerceptronLayer(
+            config.dev_n_layers,
+            config.dev_n_units,
+            config.dev_normalization,
+            config.dev_activation,
+            config.dev_dropout,
+            config.dev_regularizer,
+            config.dev_regularizer_factor,
+            name="covs_dev_map_input",
+        )
+        covs_dev_map_layer = layers.Dense(
+            config.n_channels * (config.n_channels + 1) // 2, name="covs_dev_map"
+        )
+        norm_covs_dev_map_layer = layers.LayerNormalization(
+            axis=-1, name="norm_covs_dev_map"
+        )
+
+        covs_dev_mag_inf_alpha_input_layer = LearnableTensorLayer(
+            shape=(config.n_subjects, config.n_modes, 1),
+            learn=config.learn_covariances,
+            initializer=initializers.TruncatedNormal(mean=0, stddev=0.02),
+            name="covs_dev_mag_inf_alpha_input",
+        )
+        covs_dev_mag_inf_alpha_layer = layers.Activation(
+            "softplus", name="covs_dev_mag_inf_alpha"
+        )
+        covs_dev_mag_inf_beta_input_layer = LearnableTensorLayer(
+            shape=(config.n_subjects, config.n_modes, 1),
+            learn=config.learn_covariances,
+            initializer=initializers.TruncatedNormal(mean=0, stddev=0.02),
+            name="covs_dev_mag_inf_beta_input",
+        )
+        covs_dev_mag_inf_beta_layer = layers.Activation(
+            "softplus", name="covs_dev_mag_inf_beta"
+        )
+        covs_dev_mag_layer = SampleGammaDistributionLayer(
+            config.covariances_epsilon, name="covs_dev_mag"
+        )
+        covs_dev_layer = layers.Multiply(name="covs_dev")
+
+        # Data flow to get subject specific deviations of covariances
+
+        # Get the concatenated embeddings
+        covs_mode_embeddings = covs_mode_embeddings_layer(
+            InverseCholeskyLayer(config.covariances_epsilon)(group_D)
+        )
+        covs_concat_embeddings = covs_concat_embeddings_layer(
+            [subject_embeddings, covs_mode_embeddings]
+        )
+
+        # Get the covariance deviation maps (no global magnitude information)
+        covs_dev_map_input = covs_dev_map_input_layer(covs_concat_embeddings)
+        covs_dev_map = covs_dev_map_layer(covs_dev_map_input)
+        norm_covs_dev_map = norm_covs_dev_map_layer(covs_dev_map)
+
+        # Get the deviation magnitudes (scale deviation maps globally)
+        covs_dev_mag_inf_alpha_input = covs_dev_mag_inf_alpha_input_layer(data)
+        covs_dev_mag_inf_alpha = covs_dev_mag_inf_alpha_layer(
+            covs_dev_mag_inf_alpha_input
+        )
+        covs_dev_mag_inf_beta_input = covs_dev_mag_inf_beta_input_layer(data)
+        covs_dev_mag_inf_beta = covs_dev_mag_inf_beta_layer(covs_dev_mag_inf_beta_input)
+        covs_dev_mag = covs_dev_mag_layer(
+            [covs_dev_mag_inf_alpha, covs_dev_mag_inf_beta]
+        )
+        covs_dev = covs_dev_layer([covs_dev_mag, norm_covs_dev_map])
+    else:
+        covs_dev_layer = ZeroLayer(
+            shape=(
+                config.n_subjects,
+                config.n_modes,
+                config.n_channels * (config.n_channels + 1) // 2,
+            ),
+            name="covs_dev",
+        )
+        covs_dev = covs_dev_layer(data)
+
+    # ----------------------------------------
+    # Add deviations to group level parameters
+
+    # Layer definitions
+    subject_means_layer = SubjectMapLayer(
+        "means", config.covariances_epsilon, name="subject_means"
     )
-    ll_loss_layer = LogLikelihoodLossLayer(name="ll_loss")
+    subject_covs_layer = SubjectMapLayer(
+        "covariances", config.covariances_epsilon, name="subject_covs"
+    )
 
     # Data flow
-    subjects = subjects_layer(data)  # data not used here
-    subject_embeddings = subject_embedding_layer(subjects)
-
-    group_mu = group_means_layer(data)  # data not used
-    group_D = group_covs_layer(data)  # data not used
-
-    # spatial map embeddings
-    means_mode_embedding = means_mode_embedding_layer(group_mu)
-    covs_mode_embedding = covs_mode_embedding_layer(InverseCholeskyLayer()(group_D))
-
-    # Now get the subject specific spatial maps
-    means_concat_embedding = means_concat_embedding_layer(
-        [subject_embeddings, means_mode_embedding]
-    )
-    covs_concat_embedding = covs_concat_embedding_layer(
-        [subject_embeddings, covs_mode_embedding]
-    )
-
-    if not config.dev_bayesian:
-        means_dev = means_dev_layer(means_concat_embedding)
-        means_dev = means_dev_reg_layer(means_dev)
-
-        covs_dev = covs_dev_layer(covs_concat_embedding)
-        covs_dev = covs_dev_reg_layer(covs_dev)
-    else:
-        means_dev_inf_mu = means_dev_inf_mu_layer(means_concat_embedding)
-        means_dev_inf_sigma = means_dev_inf_sigma_layer(means_concat_embedding)
-        means_dev = means_dev_layer([means_dev_inf_mu, means_dev_inf_sigma])
-
-        covs_dev_inf_mu = covs_dev_inf_mu_layer(covs_concat_embedding)
-        covs_dev_inf_sigma = covs_dev_inf_sigma_layer(covs_concat_embedding)
-        covs_dev = covs_dev_layer([covs_dev_inf_mu, covs_dev_inf_sigma])
-
     mu = subject_means_layer([group_mu, means_dev])
     D = subject_covs_layer([group_D, covs_dev])
 
-    # Mix with the mode time course
+    # -----------------------------------
+    # Mix the subject specific paraemters
+    # and get the conditional likelihood
+
+    # Layer definitions
+    mix_subject_means_covs_layer = MixSubjectSpecificParametersLayer(
+        name="mix_subject_means_covs"
+    )
+    ll_loss_layer = LogLikelihoodLossLayer(config.covariances_epsilon, name="ll_loss")
+
+    # Data flow
     m, C = mix_subject_means_covs_layer([alpha, mu, D, subj_id])
     ll_loss = ll_loss_layer([data, m, C])
 
-    if not config.dev_bayesian:
-        return tf.keras.Model(
-            inputs=[data, alpha, subj_id], outputs=[ll_loss], name="Se-DyNeMo-Obs"
-        )
-    else:
-        # Layers for dev prior
-        dev_mod_sigma_layer = ScalarLayer(
-            config.learn_dev_mod_sigma,
-            config.initial_dev_mod_sigma,
-            name="dev_mod_sigma",
-        )
-        if config.learn_means:
-            means_dev_kl_loss_layer = SubjectMapKLDivergenceLayer(
-                name="means_dev_kl_loss"
-            )
-        else:
-            means_dev_kl_loss_layer = ZeroLayer((), name="means_dev_kl_loss")
+    # ---------
+    # KL losses
 
-        if config.learn_covariances:
-            covs_dev_kl_loss_layer = SubjectMapKLDivergenceLayer(
-                name="covs_dev_kl_loss"
-            )
-        else:
-            covs_dev_kl_loss_layer = ZeroLayer((), name="covs_dev_kl_loss")
+    # For the observation model (static KL loss)
+    if config.learn_means:
+        # Layer definitions
+        means_dev_mag_mod_beta_input_layer = MultiLayerPerceptronLayer(
+            config.dev_n_layers,
+            config.dev_n_units,
+            config.dev_normalization,
+            config.dev_activation,
+            config.dev_dropout,
+            config.dev_regularizer,
+            config.dev_regularizer_factor,
+            name="means_dev_mag_mod_beta_input",
+        )
+        means_dev_mag_mod_beta_layer = layers.Dense(
+            1,
+            activation="softplus",
+            name="means_dev_mag_mod_beta",
+        )
 
-        kl_loss_layer = KLLossLayer(do_annealing=config.do_kl_annealing, name="kl_loss")
+        means_dev_mag_kl_loss_layer = StaticKLDivergenceLayer(
+            config.covariances_epsilon, name="means_dev_mag_kl_loss"
+        )
 
         # Data flow
-        dev_mod_sigma = dev_mod_sigma_layer(data)  # Data not used
-        means_dev_kl_loss = means_dev_kl_loss_layer(
-            [data, means_dev_inf_mu, means_dev_inf_sigma, dev_mod_sigma]
+        means_dev_mag_mod_beta_input = means_dev_mag_mod_beta_input_layer(
+            means_concat_embeddings
         )
-        covs_dev_kl_loss = covs_dev_kl_loss_layer(
-            [data, covs_dev_inf_mu, covs_dev_inf_sigma, dev_mod_sigma]
+        means_dev_mag_mod_beta = means_dev_mag_mod_beta_layer(
+            means_dev_mag_mod_beta_input
         )
-        kl_loss = kl_loss_layer([means_dev_kl_loss, covs_dev_kl_loss])
+        means_dev_mag_kl_loss = means_dev_mag_kl_loss_layer(
+            [
+                data,
+                means_dev_mag_inf_alpha,
+                means_dev_mag_inf_beta,
+                means_dev_mag_mod_beta,
+            ]
+        )
+    else:
+        means_dev_mag_kl_loss_layer = ZeroLayer((), name="means_dev_mag_kl_loss")
+        means_dev_mag_kl_loss = means_dev_mag_kl_loss_layer(data)
 
-        return tf.keras.Model(
-            inputs=[data, alpha, subj_id],
-            outputs=[ll_loss, kl_loss],
-            name="Se_DyNeMo-Obs",
+    if config.learn_covariances:
+        # Layer definitions
+        covs_dev_mag_mod_beta_input_layer = MultiLayerPerceptronLayer(
+            config.dev_n_layers,
+            config.dev_n_units,
+            config.dev_normalization,
+            config.dev_activation,
+            config.dev_dropout,
+            config.dev_regularizer,
+            config.dev_regularizer_factor,
+            name="covs_dev_mag_mod_beta_input",
         )
+        covs_dev_mag_mod_beta_layer = layers.Dense(
+            1,
+            activation="softplus",
+            name="covs_dev_mag_mod_beta",
+        )
+
+        covs_dev_mag_kl_loss_layer = StaticKLDivergenceLayer(
+            config.covariances_epsilon, name="covs_dev_mag_kl_loss"
+        )
+
+        # Data flow
+        covs_dev_mag_mod_beta_input = covs_dev_mag_mod_beta_input_layer(
+            covs_concat_embeddings
+        )
+        covs_dev_mag_mod_beta = covs_dev_mag_mod_beta_layer(covs_dev_mag_mod_beta_input)
+        covs_dev_mag_kl_loss = covs_dev_mag_kl_loss_layer(
+            [
+                data,
+                covs_dev_mag_inf_alpha,
+                covs_dev_mag_inf_beta,
+                covs_dev_mag_mod_beta,
+            ]
+        )
+    else:
+        covs_dev_mag_kl_loss_layer = ZeroLayer((), name="covs_dev_mag_kl_loss")
+        covs_dev_mag_kl_loss = covs_dev_mag_kl_loss_layer(data)
+
+    # Total KL loss
+    # Layer definitions
+    kl_loss_layer = KLLossLayer(config.do_kl_annealing, name="kl_loss")
+
+    # Data flow
+    kl_loss = kl_loss_layer([means_dev_mag_kl_loss, covs_dev_mag_kl_loss])
+
+    return tf.keras.Model(
+        inputs=[data, alpha, subj_id],
+        outputs=[ll_loss, kl_loss],
+        name="Se_DyNeMo-Obs",
+    )
 
 
 def get_group_means_covariances(model):
-    group_means_layer = model.get_layer("group_means")
-    group_covs_layer = model.get_layer("group_covs")
-
-    group_means = group_means_layer.vectors.numpy()
-    group_covs = group_covs_layer.bijector(
-        group_covs_layer.flattened_cholesky_factors
-    ).numpy()
-    return group_means, group_covs
+    """Wrapper for getting the group level means and covariances."""
+    group_means = dynemo_obs.get_means(model, "group_means")
+    group_covariances = dynemo_obs.get_covariances(model, "group_covs")
+    return group_means, group_covariances
 
 
 def get_subject_embeddings(model):
-    subject_embedding_layer = model.get_layer("subject_embeddings")
-    n_subjects = subject_embedding_layer.input_dim
-    return subject_embedding_layer(np.arange(n_subjects)).numpy()
+    subject_embeddings_layer = model.get_layer("subject_embeddings")
+    n_subjects = subject_embeddings_layer.input_dim
+    return subject_embeddings_layer(np.arange(n_subjects)).numpy()
 
 
-def get_mode_embeddings(model):
-    cholesky_bijector = tfb.Chain([tfb.CholeskyOuterProduct(), tfb.FillScaleTriL()])
-
-    group_means, group_covs = get_group_means_covariances(model)
-    means_mode_embedding_layer = model.get_layer("means_mode_embedding")
-    covs_mode_embedding_layer = model.get_layer("covs_mode_embedding")
-
-    means_mode_embedding = means_mode_embedding_layer(group_means)
-    covs_mode_embedding = covs_mode_embedding_layer(
-        cholesky_bijector.inverse(group_covs)
-    )
-
-    return means_mode_embedding.numpy(), covs_mode_embedding.numpy()
+def get_mode_embeddings(model, map):
+    """Wrapper for getting the mode embeddings for the means and covariances."""
+    if map == "means":
+        return _get_means_mode_embeddings(model)
+    elif map == "covs":
+        return _get_covs_mode_embeddings(model)
+    else:
+        raise ValueError("map must be either 'means' or 'covs'")
 
 
-def get_concatenated_embeddings(model):
-    subject_embeddings = get_subject_embeddings(model)
-    means_mode_embedding, covs_mode_embedding = get_mode_embeddings(model)
+def get_concatenated_embeddings(model, map, subject_embeddings=None):
+    """Getting the concatenated embeddings for the means and covariances."""
+    if subject_embeddings is None:
+        subject_embeddings = get_subject_embeddings(model)
+    if map == "means":
+        mode_embeddings = _get_means_mode_embeddings(model)
+        concat_embeddings_layer = model.get_layer("means_concat_embeddings")
+    elif map == "covs":
+        mode_embeddings = _get_covs_mode_embeddings(model)
+        concat_embeddings_layer = model.get_layer("covs_concat_embeddings")
+    else:
+        raise ValueError("map must be either 'means' or 'covs'")
+    concat_embeddings = concat_embeddings_layer([subject_embeddings, mode_embeddings])
+    return concat_embeddings.numpy()
 
-    means_concat_embedding_layer = model.get_layer("means_concat_embedding")
-    covs_concat_embedding_layer = model.get_layer("covs_concat_embedding")
 
-    means_concat_embedding = means_concat_embedding_layer(
-        [subject_embeddings, means_mode_embedding]
-    )
-    covs_concat_embedding = covs_concat_embedding_layer(
-        [subject_embeddings, covs_mode_embedding]
-    )
-    return means_concat_embedding.numpy(), covs_concat_embedding.numpy()
+def get_dev_mag_parameters(model, map):
+    """Wrapper for getting the deviance magnitude parameters
+    for the means and covariances."""
+    if map == "means":
+        return _get_means_dev_mag_parameters(model)
+    elif map == "covs":
+        return _get_covs_dev_mag_parameters(model)
+    else:
+        raise ValueError("map must be either 'means' or 'covs'")
 
 
-def get_subject_dev(model, dev_bayesian):
-    means_concat_embedding, covs_concat_embedding = get_concatenated_embeddings(model)
-    means_dev_layer = (
-        model.get_layer("means_dev_inf_mu")
-        if dev_bayesian
-        else model.get_layer("means_dev")
-    )
-    covs_dev_layer = (
-        model.get_layer("covs_dev_inf_mu")
-        if dev_bayesian
-        else model.get_layer("covs_dev")
-    )
+def get_dev_mag(model, map):
+    """Getting the deviance magnitude for the means and covariances."""
+    if map == "means":
+        alpha, beta = _get_means_dev_mag_parameters(model)
+        dev_mag_layer = model.get_layer("means_dev_mag")
+    elif map == "covs":
+        alpha, beta = _get_covs_dev_mag_parameters(model)
+        dev_mag_layer = model.get_layer("covs_dev_mag")
+    else:
+        raise ValueError("map must be either 'means' or 'covs'")
+    dev_mag = dev_mag_layer([alpha, beta])
+    return dev_mag.numpy()
 
-    means_dev = means_dev_layer(means_concat_embedding)
-    covs_dev = covs_dev_layer(covs_concat_embedding)
+
+def get_dev_map(model, map, subject_embeddings=None):
+    """Getting the deviance map for the means and covariances."""
+    concat_embeddings = get_concatenated_embeddings(model, map, subject_embeddings)
+    if map == "means":
+        dev_map_input_layer = model.get_layer("means_dev_map_input")
+        dev_map_layer = model.get_layer("means_dev_map")
+        norm_dev_map_layer = model.get_layer("norm_means_dev_map")
+    elif map == "covs":
+        dev_map_input_layer = model.get_layer("covs_dev_map_input")
+        dev_map_layer = model.get_layer("covs_dev_map")
+        norm_dev_map_layer = model.get_layer("norm_covs_dev_map")
+    else:
+        raise ValueError("map must be either 'means' or 'covs'")
+    dev_map_input = dev_map_input_layer([np.zeros(1), concat_embeddings])
+    dev_map = dev_map_layer(dev_map_input)
+    norm_dev_map = norm_dev_map_layer(dev_map)
+    return norm_dev_map.numpy()
+
+
+def get_subject_dev(
+    model, learn_means, learn_covariances, subject_embeddings=None, n_neighbours=2
+):
+    means_dev_layer = model.get_layer("means_dev")
+    covs_dev_layer = model.get_layer("covs_dev")
+
+    if subject_embeddings is not None:
+        nearest_neighbours = get_nearest_neighbours(
+            model, subject_embeddings, n_neighbours
+        )
+
+    if learn_means:
+        means_dev_mag = get_dev_mag(model, "means")
+        if subject_embeddings is not None:
+            means_dev_mag = np.mean(
+                tf.gather(means_dev_mag, nearest_neighbours, axis=0),
+                axis=1,
+            )
+        means_dev_map = get_dev_map(model, "means", subject_embeddings)
+        means_dev = means_dev_layer([means_dev_mag, means_dev_map])
+    else:
+        means_dev = means_dev_layer(1)
+
+    if learn_covariances:
+        covs_dev_mag = get_dev_mag(model, "covs")
+        if subject_embeddings is not None:
+            covs_dev_mag = np.mean(
+                tf.gather(covs_dev_mag, nearest_neighbours, axis=0),
+                axis=1,
+            )
+        covs_dev_map = get_dev_map(model, "covs", subject_embeddings)
+        covs_dev = covs_dev_layer([covs_dev_mag, covs_dev_map])
+    else:
+        covs_dev = covs_dev_layer(1)
 
     return means_dev.numpy(), covs_dev.numpy()
 
 
-def get_subject_means_covariances(model, dev_bayesian):
+def get_subject_means_covariances(
+    model, learn_means, learn_covariances, subject_embeddings=None, n_neighbours=2
+):
     group_means, group_covs = get_group_means_covariances(model)
-    means_dev, covs_dev = get_subject_dev(model, dev_bayesian)
+    means_dev, covs_dev = get_subject_dev(
+        model, learn_means, learn_covariances, subject_embeddings, n_neighbours
+    )
 
     subject_means_layer = model.get_layer("subject_means")
     subject_covs_layer = model.get_layer("subject_covs")
@@ -556,11 +793,84 @@ def get_subject_means_covariances(model, dev_bayesian):
     return mu.numpy(), D.numpy()
 
 
+def _get_means_mode_embeddings(model):
+    group_means, _ = get_group_means_covariances(model)
+    means_mode_embeddings_layer = model.get_layer("means_mode_embeddings")
+    means_mode_embeddings = means_mode_embeddings_layer(group_means)
+    return means_mode_embeddings.numpy()
+
+
+def _get_covs_mode_embeddings(model):
+    cholesky_bijector = tfb.Chain([tfb.CholeskyOuterProduct(), tfb.FillScaleTriL()])
+    _, group_covs = get_group_means_covariances(model)
+    covs_mode_embeddings_layer = model.get_layer("covs_mode_embeddings")
+    covs_mode_embeddings = covs_mode_embeddings_layer(
+        cholesky_bijector.inverse(group_covs)
+    )
+    return covs_mode_embeddings.numpy()
+
+
+def _get_means_dev_mag_parameters(model):
+    means_dev_mag_inf_alpha_input_layer = model.get_layer(
+        "means_dev_mag_inf_alpha_input"
+    )
+    means_dev_mag_inf_alpha_layer = model.get_layer("means_dev_mag_inf_alpha")
+    means_dev_mag_inf_beta_input_layer = model.get_layer("means_dev_mag_inf_beta_input")
+    means_dev_mag_inf_beta_layer = model.get_layer("means_dev_mag_inf_beta")
+
+    means_dev_mag_inf_alpha_input = means_dev_mag_inf_alpha_input_layer(1)
+    means_dev_mag_inf_alpha = means_dev_mag_inf_alpha_layer(
+        means_dev_mag_inf_alpha_input
+    )
+
+    means_dev_mag_inf_beta_input = means_dev_mag_inf_beta_input_layer(1)
+    means_dev_mag_inf_beta = means_dev_mag_inf_beta_layer(means_dev_mag_inf_beta_input)
+    return means_dev_mag_inf_alpha.numpy(), means_dev_mag_inf_beta.numpy()
+
+
+def _get_covs_dev_mag_parameters(model):
+    covs_dev_mag_inf_alpha_input_layer = model.get_layer("covs_dev_mag_inf_alpha_input")
+    covs_dev_mag_inf_alpha_layer = model.get_layer("covs_dev_mag_inf_alpha")
+    covs_dev_mag_inf_beta_input_layer = model.get_layer("covs_dev_mag_inf_beta_input")
+    covs_dev_mag_inf_beta_layer = model.get_layer("covs_dev_mag_inf_beta")
+
+    covs_dev_mag_inf_alpha_input = covs_dev_mag_inf_alpha_input_layer(1)
+    covs_dev_mag_inf_alpha = covs_dev_mag_inf_alpha_layer(covs_dev_mag_inf_alpha_input)
+
+    covs_dev_mag_inf_beta_input = covs_dev_mag_inf_beta_input_layer(1)
+    covs_dev_mag_inf_beta = covs_dev_mag_inf_beta_layer(covs_dev_mag_inf_beta_input)
+    return covs_dev_mag_inf_alpha.numpy(), covs_dev_mag_inf_beta.numpy()
+
+
 def set_bayesian_kl_scaling(model, n_batches, learn_means, learn_covariances):
     if learn_means:
-        means_dev_kl_loss_layer = model.get_layer("means_dev_kl_loss")
-        means_dev_kl_loss_layer.n_batches = n_batches
+        means_dev_mag_kl_loss_layer = model.get_layer("means_dev_mag_kl_loss")
+        means_dev_mag_kl_loss_layer.n_batches = n_batches
 
     if learn_covariances:
-        covs_dev_kl_loss_layer = model.get_layer("covs_dev_kl_loss")
-        covs_dev_kl_loss_layer.n_batches = n_batches
+        covs_dev_mag_kl_loss_layer = model.get_layer("covs_dev_mag_kl_loss")
+        covs_dev_mag_kl_loss_layer.n_batches = n_batches
+
+
+def get_nearest_neighbours(model, subject_embeddings, n_neighbours):
+    """Get nearest neighbours for each subject in the embedding space."""
+    model_subject_embeddings = get_subject_embeddings(model)
+    distances = np.linalg.norm(
+        np.expand_dims(subject_embeddings, axis=1)
+        - np.expand_dims(model_subject_embeddings, axis=0),
+        axis=-1,
+    )
+
+    # Sort distances and get indices of nearest neighbours
+    sorted_distances = np.argsort(distances, axis=1)
+    nearest_neighbours = sorted_distances[:, :n_neighbours]
+    return nearest_neighbours
+
+
+def set_dev_mlp_reg_scaling(model, n_batches, learn_means, learn_covariances):
+    if learn_means:
+        model.get_layer("means_dev_map_input").n_batches = n_batches
+        model.get_layer("means_dev_mag_mod_beta_input").n_batches = n_batches
+    if learn_covariances:
+        model.get_layer("covs_dev_map_input").n_batches = n_batches
+        model.get_layer("covs_dev_mag_mod_beta_input").n_batches = n_batches

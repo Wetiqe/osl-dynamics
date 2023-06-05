@@ -2,24 +2,30 @@
 
 """
 
+import logging
+import os
 import re
 from abc import abstractmethod
-from io import StringIO
 from dataclasses import dataclass
+from io import StringIO
 
 import numpy as np
 import tensorflow
+import yaml
+from tensorflow.data import Dataset
 from tensorflow.keras import optimizers
-from tensorflow.python.data import Dataset
 from tensorflow.python.distribute.distribution_strategy_context import get_strategy
 from tensorflow.python.distribute.mirrored_strategy import MirroredStrategy
 from tqdm.auto import tqdm as tqdm_auto
 from tqdm.keras import TqdmCallback
 
-from osl_dynamics.data import Data
+import osl_dynamics
+from osl_dynamics import data
 from osl_dynamics.inference import callbacks, initializers
-from osl_dynamics.utils.misc import check_iterable_type, replace_argument
+from osl_dynamics.utils.misc import NumpyLoader, get_argument, replace_argument
 from osl_dynamics.utils.model import HTMLTable, LatexTable
+
+_logger = logging.getLogger("osl-dynamics")
 
 
 @dataclass
@@ -27,6 +33,7 @@ class BaseModelConfig:
     """Base class for settings for all models."""
 
     # Model choices
+    model_name: str = None
     multiple_dynamics: bool = False
 
     # Training parameters
@@ -95,6 +102,9 @@ class ModelBase:
     Acts as a wrapper for a standard Keras model.
     """
 
+    osld_version = None
+    config_type = None
+
     def __init__(self, config):
         self._identifier = np.random.randint(100000)
         self.config = config
@@ -149,6 +159,8 @@ class ModelBase:
 
         Parameters
         ----------
+        args : arguments
+            Arguments for keras.Model.fit().
         use_tqdm : bool
             Should we use a tqdm progress bar instead of the usual output from
             tensorflow.
@@ -161,25 +173,40 @@ class ModelBase:
             Path to save the best model to.
         additional_callbacks : list
             List of keras callback objects.
+        kwargs : keyword arguments
+            Keyword arguments for keras.Model.fit()
 
         Returns
         -------
         history : history
             The training history.
         """
+        # If a osl_dynamics.data.Data object has been passed for the x arguments,
+        # replace it with a tensorflow dataset
+        x = get_argument(self.model.fit, "x", args, kwargs)
+        x = self.make_dataset(x, shuffle=True, concatenate=True)
+        args, kwargs = replace_argument(self.model.fit, "x", x, args, kwargs)
+
+        # Use the number of epochs in the config if it has not been passed
+        if get_argument(self.model.fit, "epochs", args, kwargs) is None:
+            args, kwargs = replace_argument(
+                self.model.fit, "epochs", self.config.n_epochs, args, kwargs
+            )
+
+        # If we're saving the model after a particular epoch make sure it's
+        # less than the total number of epochs
+        if save_best_after is not None:
+            epochs = get_argument(self.model.fit, "epochs", args, kwargs)
+            if epochs < save_best_after:
+                raise ValueError("save_best_after must be less than epochs.")
+
+        # Callbacks to add to the ones the user passed
         additional_callbacks = []
 
         # Callback to display a progress bar with tqdm
         if use_tqdm:
-            if tqdm_class is not None:
-                tqdm_callback = TqdmCallback(verbose=0, tqdm_class=tqdm_class)
-            else:
-                # Create a tqdm class with a progress bar width of 98 characters
-                class tqdm_class(tqdm_auto):
-                    def __init__(self, *args, **kwargs):
-                        super().__init__(*args, **kwargs, ncols=98)
-
-                tqdm_callback = TqdmCallback(verbose=0, tqdm_class=tqdm_class)
+            tqdm_class = tqdm_class or tqdm_auto
+            tqdm_callback = TqdmCallback(verbose=0, tqdm_class=tqdm_class)
             additional_callbacks.append(tqdm_callback)
 
         # Callback to save the best model after a certain number of epochs
@@ -204,7 +231,8 @@ class ModelBase:
         if use_tqdm:
             args, kwargs = replace_argument(self.model.fit, "verbose", 0, args, kwargs)
 
-        return self.model.fit(*args, **kwargs)
+        history = self.model.fit(*args, **kwargs)
+        return history.history
 
     def load_weights(self, filepath):
         """Load weights of the model from a file.
@@ -215,51 +243,87 @@ class ModelBase:
             Path to file containing model weights.
         """
         with self.config.strategy.scope():
-            self.model.load_weights(filepath)
+            return self.model.load_weights(filepath)
 
     def reset_weights(self):
-        """Reset the model as if you've built a new model."""
+        """Resets trainable variables in the model to their initial value."""
         initializers.reinitialize_model_weights(self.model)
 
-    def _make_dataset(self, inputs):
-        """Make a dataset.
+    def reset(self):
+        """Reset the model as if you've built a new model."""
+        self.reset_weights()
+        self.compile()
+
+    def make_dataset(self, inputs, shuffle=False, concatenate=False, subj_id=False):
+        """Converts a Data object into a TensorFlow Dataset.
 
         Parameters
         ----------
         inputs : osl_dynamics.data.Data
-            Data object.
+            Data object. If a str or numpy array is passed this function will
+            convert it into a Data object.
+        shuffle : bool
+            Should we shuffle the data?
+        concatenate : bool
+            Should we return a single TensorFlow Dataset or a list of Datasets.
+        subj_id : bool
+            Should we include the subject id in the dataset?
 
         Returns
         -------
-        dataset : tensorflow.data.Dataset
-            Tensorflow dataset that can be used for training.
+        dataset : tensorflow.data.Dataset or list
+            TensorFlow Dataset (or list of Datasets) that can be used for
+            training/evaluating.
         """
-        if isinstance(inputs, Data):
-            return inputs.dataset(self.config.sequence_length, shuffle=False)
-        if isinstance(inputs, Dataset):
-            return [inputs]
-        if isinstance(inputs, str):
-            return [Data(inputs).dataset(self.config.sequence_length, shuffle=False)]
-        if isinstance(inputs, np.ndarray):
-            if inputs.ndim == 2:
-                return [
-                    Data(inputs).dataset(self.config.sequence_length, shuffle=False)
-                ]
-            if inputs.ndim == 3:
-                return [
-                    Data(subject).dataset(self.config.sequence_length, shuffle=False)
-                    for subject in inputs
-                ]
-        if check_iterable_type(inputs, Dataset):
-            return inputs
-        if check_iterable_type(inputs, str):
-            datasets = [
-                Data(subject).dataset(self.config.sequence_length, shuffle=False)
-                for subject in inputs
-            ]
-            return datasets
+        if isinstance(inputs, str) or isinstance(inputs, np.ndarray):
+            # str or numpy array -> Data object
+            inputs = data.Data(inputs)
+
+        if isinstance(inputs, data.Data):
+            # Data object -> list of Dataset if concatenate=False or
+            # Data object -> Dataset if concatenate=True
+            outputs = inputs.dataset(
+                self.config.sequence_length,
+                self.config.batch_size,
+                shuffle=shuffle,
+                concatenate=concatenate,
+                subj_id=subj_id,
+            )
+        elif isinstance(inputs, Dataset) and not concatenate:
+            # Dataset -> list of Dataset if concatenate=False
+            outputs = [inputs]
+        else:
+            outputs = inputs
+
+        return outputs
+
+    def get_training_time_series(self, training_data, prepared=True, concatenate=False):
+        """Get the time series used for training from a Data object.
+
+        Parameters
+        ----------
+        training_data : osl_dynamics.data.Data
+            Data object.
+        prepared : bool
+            Should we return the prepared data? If not, we return the raw data.
+        concatenate : bool
+            Should we concatenate the data for each subject?
+
+        Returns
+        -------
+        training_data : np.ndarray or list
+            Training data time series.
+        """
+        return training_data.trim_time_series(
+            self.config.sequence_length, prepared=prepared, concatenate=concatenate
+        )
 
     def summary_string(self):
+        """Return a summary of the model as a string.
+
+        This is a modified version of the keras.Model.summary() method which
+        makes the output easier to parse.
+        """
         stringio = StringIO()
         self.model.summary(
             print_fn=lambda s: stringio.write(s + "\n"), line_length=1000
@@ -267,6 +331,19 @@ class ModelBase:
         return stringio.getvalue()
 
     def summary_table(self, renderer):
+        """Return a summary of the model as a table (HTML or LaTeX).
+
+        Parameters
+        ----------
+        renderer : str
+            Renderer to use. Either "html" or "latex".
+
+        Returns
+        -------
+        table : str
+            Summary of the model as a table.
+        """
+
         summary = self.summary_string()
 
         renderers = {"html": HTMLTable, "latex": LatexTable}
@@ -275,7 +352,7 @@ class ModelBase:
         headers = [h for h in re.split(r"\s{2,}", summary.splitlines()[2]) if h != ""]
         columns = [summary.splitlines()[2].find(title) for title in headers] + [-1]
 
-        # Create HTML table.
+        # Create HTML table
         table = renderers.get(renderer, HTMLTable)(headers)
         for line in summary.splitlines()[4:]:
             if (
@@ -299,10 +376,132 @@ class ModelBase:
         return table.output()
 
     def html_summary(self):
+        """Return a summary of the model as an HTML table."""
         return self.summary_table(renderer="html")
 
     def latex_summary(self):
+        """Return a summary of the model as a LaTeX table."""
         return self.summary_table(renderer="latex")
 
     def _repr_html_(self):
+        """Display the model as an HTML table in Jupyter notebooks.
+
+        This is called when you type the variable name of the model in a
+        Jupyter notebook. It is unlikely that you will need to call this.
+        """
         return self.html_summary()
+
+    def save_config(self, dirname):
+        """Saves config object as a .yml file.
+
+        Parameters
+        ----------
+        dirname : str
+            Directory to save config.yml.
+        """
+        os.makedirs(dirname, exist_ok=True)
+
+        config_dict = self.config.__dict__.copy()
+        # for serialisability of the dict
+        non_serializable_keys = [
+            key for key in list(config_dict.keys()) if "regularizer" in key
+        ]
+        non_serializable_keys.append("strategy")
+        for key in non_serializable_keys:
+            config_dict[key] = None
+
+        with open(f"{dirname}/config.yml", "w") as file:
+            file.write(f"# osl-dynamics version: {osl_dynamics.__version__}\n")
+            yaml.dump(config_dict, file)
+
+    def save(self, dirname):
+        """Saves config object and weights of the model.
+
+        This is a wrapper for self.save_config and self.save_weights.
+
+        Parameters
+        ----------
+        dirname : str
+            Directory to save the config object and weights of the model.
+        """
+        self.save_config(dirname)
+        self.save_weights(
+            f"{dirname}/weights"
+        )  # will use the keras method: self.model.save_weights()
+
+    @staticmethod
+    def load_config(dirname):
+        """Load a config object from a .yml file.
+
+        Parameters
+        ----------
+        dirname : str
+            Directory to load config.yml from.
+
+        Returns
+        -------
+        config : dict
+            Dictionary containing values used to create the Config object.
+        version : str
+            Version used to train the model.
+        """
+
+        # Load config dict
+        with open(f"{dirname}/config.yml", "r") as file:
+            config_dict = yaml.load(file, NumpyLoader)
+
+        # Check what version the model was trained with
+        version_comments = []
+        with open(f"{dirname}/config.yml", "r") as file:
+            for line in file.readlines():
+                if "osl-dynamics version" in line:
+                    version_comments.append(line)
+        if len(version_comments) == 0:
+            version = "<1.1.6"
+        elif len(version_comments) == 1:
+            version = version_comments[0].split(":")[-1].strip()
+        else:
+            raise ValueError(
+                "version could not be read from config.yml. Make sure there "
+                + "is only one comment containing the version in config.yml"
+            )
+
+        return config_dict, version
+
+    @classmethod
+    def load(cls, dirname):
+        """Load model from dirname.
+
+        Parameters
+        ----------
+        dirname : str
+            Directory where config.yml and weights are stored.
+
+        Returns
+        -------
+        model : Model
+            Model object.
+        """
+        _logger.info(f"Loading model: {dirname}")
+
+        # Load config dict and version from yml file
+        config_dict, version = cls.load_config(dirname)
+
+        if version in ["<1.1.6", "1.1.6", "1.1.7"]:
+            raise ValueError(
+                f"model was trained using osl-dynamics version {version}. "
+                + "This is incompatible with the current version. "
+                + "Please revert to v1.1.7 to load this model."
+            )
+
+        # Create config object
+        config = cls.config_type(**config_dict)
+
+        # Create model
+        model = cls(config)
+        model.osld_version = version
+
+        # Restore weights
+        model.load_weights(f"{dirname}/weights").expect_partial()
+
+        return model

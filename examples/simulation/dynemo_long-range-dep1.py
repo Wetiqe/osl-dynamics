@@ -6,7 +6,6 @@
 
 print("Setting up")
 import os
-import numpy as np
 from osl_dynamics import data, simulation
 from osl_dynamics.inference import tf_ops, modes, metrics, callbacks
 from osl_dynamics.models.dynemo import Config, Model
@@ -96,7 +95,7 @@ inf_alp = model.get_alpha(prediction_dataset)
 
 # Mode time courses
 sim_stc = sim.mode_time_course
-inf_stc = modes.time_courses(inf_alp)
+inf_stc = modes.argmax_time_courses(inf_alp)
 
 # Calculate the dice coefficient between mode time courses
 orders = modes.match_modes(sim_stc, inf_stc, return_order=True)
@@ -126,7 +125,7 @@ plotting.plot_matrices(inf_cov, filename="figures/inf_cov.png")
 
 # Sample from model RNN
 sam_alp = model.sample_alpha(25600)
-sam_stc = modes.time_courses(sam_alp)
+sam_stc = modes.argmax_time_courses(sam_alp)
 
 plotting.plot_mode_lifetimes(
     sam_stc,
@@ -135,6 +134,3 @@ plotting.plot_mode_lifetimes(
     y_label="Occurrence",
     filename="figures/sam_lt.png",
 )
-
-# Delete temporary directory
-training_data.delete_dir()

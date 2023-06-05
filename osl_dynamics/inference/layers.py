@@ -5,10 +5,38 @@
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
-from tensorflow.keras import activations, layers
-from osl_dynamics.inference.initializers import WeightInitializer
+from tensorflow.keras import activations, layers, initializers, regularizers
+
+import osl_dynamics.inference.initializers as osld_initializers
 
 tfb = tfp.bijectors
+
+
+@tf.function
+def add_epsilon(A, epsilon, diag=False):
+    """Adds epsilon the the diagonal of batches of square matrices
+    or all elements of matrices.
+
+    Parameters
+    ----------
+    A : tf.Tensor
+        Batches of square matrices or vectors.
+        Shape is (..., N, N) or (..., N).
+    epsilon : float
+        Small error added to the diagonal of the matrices or every element
+        of the vectors.
+    diag : bool
+        Do we want to add epsilon to the diagonal only?
+    """
+    epsilon = tf.cast(epsilon, dtype=tf.float32)
+    A_shape = tf.shape(A)
+    if diag:
+        # Add epsilon to the diagonal only
+        I = tf.eye(A_shape[-1])
+    else:
+        # Add epsilon to all elements
+        I = 1.0
+    return A + epsilon * I
 
 
 def NormalizationLayer(norm_type, *args, **kwargs):
@@ -48,27 +76,36 @@ def RNNLayer(rnn_type, *args, **kwargs):
 class DummyLayer(layers.Layer):
     """Dummy layer.
 
-    Returns the inputs without modification and optionally adds loss
-    according to the input.
+    Returns the inputs without modification.
+    """
+
+    def call(self, inputs, **kwargs):
+        return inputs
+
+
+class AddRegularizationLossLayer(layers.Layer):
+    """Adds a regularization loss.
+
+    Can be used as a wrapper for a keras regularizer. Inputs are used to
+    calculate the regularization loss and returned without modification.
 
     Parameters
     ----------
-    regularisation : str
-        Type of regularisation.
-    reg_strength : float
-        Strength of regularisation.
+    reg : str
+        Type of regularization.
+    strength : float
+        Strength of regularization. The regularization is multiplied
+        by the strength before being added to the loss
     """
 
-    def __init__(self, regularisation=None, reg_strength=0, **kwargs):
+    def __init__(self, reg, strength, **kwargs):
         super().__init__(**kwargs)
-        self.regularisation = regularisation
-        self.reg_strength = reg_strength
+        self.reg = regularizers.get(reg)
+        self.strength = strength
 
     def call(self, inputs, **kwargs):
-        if self.regularisation == "l2":
-            l2_norm = tf.reduce_sum(tf.square(inputs))
-            self.add_loss(self.reg_strength * l2_norm)
-
+        reg_loss = self.reg(inputs)
+        self.add_loss(self.strength * reg_loss)
         return inputs
 
 
@@ -124,7 +161,8 @@ class TFRangeLayer(layers.Layer):
 
 class ZeroLayer(layers.Layer):
     """Layer that outputs tensor of zeros.
-    Wrapper for tf.zeros.
+
+    Wrapper for tf.zeros(). Note, the inputs to this layer are not used.
 
     Parameters
     ----------
@@ -137,16 +175,56 @@ class ZeroLayer(layers.Layer):
         self.shape = shape
 
     def call(self, inputs):
-        # Input not used here
         return tf.zeros(self.shape)
 
 
 class InverseCholeskyLayer(layers.Layer):
-    """Layer for getting Cholesky vectors from postive definite symmetric matrices."""
+    """Layer for getting Cholesky vectors from postive definite symmetric matrices.
+
+    Parameters
+    ----------
+    epsilon : float
+        Small error added to the diagonal of the matrices.
+    """
+
+    def __init__(self, epsilon, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+        self.bijector = tfb.Chain([tfb.CholeskyOuterProduct(), tfb.FillScaleTriL()])
 
     def call(self, inputs):
-        bijector = tfb.Chain([tfb.CholeskyOuterProduct(), tfb.FillScaleTriL()])
-        return bijector.inverse(inputs)
+        inputs = add_epsilon(inputs, self.epsilon, diag=True)
+        return self.bijector.inverse(inputs)
+
+
+class SampleGammaDistributionLayer(layers.Layer):
+    """Layer for sampling from a gamma distribution.
+
+    This layer accepts the shape and rate
+    and outputs samples from a gamma distribution.
+
+    Parameters
+    ----------
+    epsilon : float
+        Error to add to the shape and rate for numerical stability.
+    """
+
+    def __init__(self, epsilon, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+
+    def call(self, inputs, training=None, **kwargs):
+        alpha, beta = inputs
+        alpha = add_epsilon(alpha, self.epsilon)
+        beta = add_epsilon(beta, self.epsilon)
+        if training:
+            N = tfp.distributions.Gamma(
+                concentration=alpha, rate=beta, allow_nan_stats=False
+            )
+            return N.sample()
+        else:
+            mode = (alpha - 1) / beta
+            return tf.maximum(mode, 0)
 
 
 class SampleNormalDistributionLayer(layers.Layer):
@@ -154,10 +232,20 @@ class SampleNormalDistributionLayer(layers.Layer):
 
     This layer accepts the mean and the standard deviation and
     outputs samples from a normal distribution.
+
+    Parameters
+    ----------
+    epsilon : float
+        Error to add to the standard deviations for numerical stability.
     """
+
+    def __init__(self, epsilon, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
 
     def call(self, inputs, training=None, **kwargs):
         mu, sigma = inputs
+        sigma = add_epsilon(sigma, self.epsilon)
         if training:
             N = tfp.distributions.Normal(loc=mu, scale=sigma)
             return N.sample()
@@ -166,11 +254,31 @@ class SampleNormalDistributionLayer(layers.Layer):
 
 
 class SampleGumbelSoftmaxDistributionLayer(layers.Layer):
-    """Layer for sampling from a Gumbel-Softmax distribution."""
+    """Layer for sampling from a Gumbel-Softmax distribution.
+
+    Parameters
+    ----------
+    temperature : float
+        Temperature for the Gumbel-Softmax distribution.
+    """
+
+    def __init__(self, temperature, **kwargs):
+        super().__init__(**kwargs)
+        self.temperature = temperature
 
     def call(self, inputs, **kwargs):
-        gs = tfp.distributions.RelaxedOneHotCategorical(temperature=0.05, logits=inputs)
+        gs = tfp.distributions.RelaxedOneHotCategorical(
+            temperature=self.temperature, logits=inputs
+        )
         return gs.sample()
+
+
+class SampleOneHotCategoricalDistributionLayer(layers.Layer):
+    """Layer for sampling from a Categorical distribution."""
+
+    def call(self, inputs, **kwargs):
+        cat = tfp.distributions.OneHotCategorical(logits=inputs, dtype=tf.float32)
+        return cat.sample()
 
 
 class SoftmaxLayer(layers.Layer):
@@ -191,66 +299,116 @@ class SoftmaxLayer(layers.Layer):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.initial_temperature = initial_temperature
-        self.learn_temperature = learn_temperature
-        self.temperature_initializer = WeightInitializer(self.initial_temperature)
-
-    def build(self, input_shape):
-        self.temperature = self.add_weight(
-            "temperature",
-            shape=(),
-            dtype=tf.float32,
-            initializer=self.temperature_initializer,
-            trainable=self.learn_temperature,
-        )
-        self.built = True
+        self.layers = [
+            LearnableTensorLayer(
+                shape=(),
+                learn=learn_temperature,
+                initial_value=initial_temperature,
+                name=self.name + "_kernel",
+            )
+        ]
 
     def call(self, inputs, **kwargs):
-        return activations.softmax(inputs / self.temperature, axis=2)
+        temperature = self.layers[0](inputs)
+        return activations.softmax(inputs / temperature, axis=2)
 
 
-class ScalarLayer(layers.Layer):
-    """Layer to learn a single scalar.
+class LearnableTensorLayer(layers.Layer):
+    """Layer to learn a tensor.
 
     Parameters
     ----------
+    shape : tuple
+        Shape of the tensor.
     learn : bool
-        Should we learn the scalar?
+        Should we learn the tensor?
+    initializer : tf.keras.initializers.Initializer
+        Initializer for the tensor.
     initial_value : float
-        Initial value for the scalar.
+        Initial value for the tensor if initializer is not passed.
+    regularizer : osl-dynamics regularizer
+        Regularizer for the tensor. Must be from osl_dynamics.inference.regularizers.
     """
 
     def __init__(
         self,
-        learn,
-        initial_value,
+        shape,
+        learn=True,
+        initializer=None,
+        initial_value=None,
+        regularizer=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
+
+        # Bool for if we're learning the tensor
         self.learn = learn
-        if initial_value is None:
-            self.initial_value = 1
+
+        # Shape of the tensor
+        if shape is None:
+            raise ValueError("A shape must be passed to LearnableTensorLayer.")
+        self.shape = shape
+
+        # Initial value of the tensor
+        self.initial_value = initial_value
+        if self.initial_value is not None:
+            self.initial_value = np.array(initial_value).astype(np.float32)
+
+        # Setup the tensor initializer
+        if initializer is None:
+            # Initializer not passed, use the initial value
+            if self.initial_value is None:
+                raise ValueError("initializer or initial_value must be passed.")
+            elif self.initial_value.shape != shape:
+                raise ValueError(
+                    "Shape of initial_value must match that of the tensor. "
+                    + f"Expected {shape}, got {self.initial_value.shape}."
+                )
+            self.tensor_initializer = osld_initializers.WeightInitializer(
+                self.initial_value
+            )
         else:
-            self.initial_value = initial_value
-        self.scalar_initializer = WeightInitializer(self.initial_value)
+            # Use the initializer passed, initial_value is ignored
+            self.tensor_initializer = initializer
+
+        # Regularizer for the tensor
+        # This should be a function of the tensor that returns a float
+        self.regularizer = regularizer
+
+    def add_regularization(self, tensor, inputs):
+        # Calculate the regularisation from the tensor
+        reg = self.regularizer(tensor)
+
+        # Calculate the scaling factor for the regularization
+        # Note, inputs.shape[0] must be the batch size
+        batch_size = tf.cast(tf.shape(inputs)[0], tf.float32)
+        n_batches = self.regularizer.n_batches
+        scaling_factor = batch_size * n_batches
+        reg /= scaling_factor
+
+        # Add regularization to the loss and display while training
+        self.add_loss(reg)
+        self.add_metric(reg, name=self.name)
 
     def build(self, input_shape):
-        self.scalar = self.add_weight(
-            "scalar",
+        # Create a weight for the tensor
+        self.tensor = self.add_weight(
+            "tensor",
+            shape=self.shape,
             dtype=tf.float32,
-            initializer=self.scalar_initializer,
+            initializer=self.tensor_initializer,
             trainable=self.learn,
         )
         self.built = True
 
-    def call(self, inputs, **kwargs):
-        return self.scalar
+    def call(self, inputs, training=None, **kwargs):
+        if self.regularizer is not None and training:
+            self.add_regularization(self.tensor, inputs)
+        return self.tensor
 
 
-class MeanVectorsLayer(layers.Layer):
-    """Layer to learn a set of mean vectors.
-
-    The vectors are free parameters.
+class VectorsLayer(layers.Layer):
+    """Layer to learn a set of vectors.
 
     Parameters
     ----------
@@ -262,8 +420,8 @@ class MeanVectorsLayer(layers.Layer):
         Should we learn the vectors?
     initial_value : np.ndarray
         Initial value for the vectors.
-    regularizer : tf.keras.regularizers.Regularizer
-        Regularizer for vectors.
+    regularizer : osl-dynamics regularizer
+        Regularizer for the tensor. Must be from osl_dynamics.inference.regularizers.
     """
 
     def __init__(
@@ -276,59 +434,39 @@ class MeanVectorsLayer(layers.Layer):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.n = n
-        self.m = m
-        self.learn = learn
 
-        # Initialisation for vectors
-        if initial_value is None:
-            self.initial_value = np.random.normal(0, 0.5, size=[n, m]).astype(
-                np.float32
-            )
+        if initial_value is not None:
+            # Check initial_value is the correct shape
+            if initial_value.shape != (n, m):
+                raise ValueError(f"initial_value shape must be ({n}, {m}).")
+            initial_value = initial_value.astype("float32")
+
+            # We don't need an initializer
+            initializer = None
         else:
-            if initial_value.ndim != 2:
-                raise ValueError(
-                    "a (n_modes, n_channels) array must be passed for initial_means."
-                )
-            if initial_value.shape[-1] != m:
-                raise ValueError(
-                    f"mismatch between the number of channels ({m}) and number of "
-                    + f"elements in initial_means ({initial_value.shape[-1]})."
-                )
-            if initial_value.shape[0] != n:
-                raise ValueError(
-                    "mismatch bettwen the number of modes and vectors in "
-                    + f"initial_means ({initial_value.shape[0]})."
-                )
-            self.initial_value = initial_value.astype("float32")
-        self.vectors_initializer = WeightInitializer(self.initial_value)
+            # No initial value has been passed, set the initializer
+            if learn:
+                initializer = initializers.TruncatedNormal(mean=0, stddev=0.02)
+            else:
+                initializer = initializers.Zeros()
 
-        # Regulariser
-        self.regularizer = regularizer
-
-    def build(self, input_shape):
-        self.vectors = self.add_weight(
-            "vectors",
-            shape=(self.n, self.m),
-            dtype=tf.float32,
-            initializer=self.vectors_initializer,
-            trainable=self.learn,
-        )
-        self.built = True
+        # We use self.layers for compatibility with
+        # initializers.reinitialize_model_weights
+        self.layers = [
+            LearnableTensorLayer(
+                shape=(n, m),
+                learn=learn,
+                initializer=initializer,
+                initial_value=initial_value,
+                regularizer=regularizer,
+                name=self.name + "_kernel",
+            )
+        ]
 
     def call(self, inputs, **kwargs):
-        if self.regularizer is not None:
-            reg = self.regularizer(self.vectors)
-
-            # Calculate the scaling on regularisation
-            batch_size = tf.cast(tf.shape(inputs)[0], tf.float32)
-            n_batches = self.regularizer.n_batches
-            scaling_factor = batch_size * n_batches
-            reg = reg / scaling_factor
-
-            self.add_loss(reg)
-            self.add_metric(reg, name=self.name)
-        return self.vectors
+        learnable_tensors_layer = self.layers[0]
+        vectors = learnable_tensors_layer(inputs, **kwargs)
+        return vectors
 
 
 class CovarianceMatricesLayer(layers.Layer):
@@ -348,8 +486,10 @@ class CovarianceMatricesLayer(layers.Layer):
         Should the matrices be learnable?
     initial_value : np.ndarray
         Initial values for the matrices.
-    regularizer : tf.keras.regularizers.Regularizer
-        Regularizer for matrices.
+    epsilon : float
+        Error added to the diagonal of covariances matrices for numerical stability.
+    regularizer : osl-dynamics regularizer
+        Regularizer for the tensor. Must be from osl_dynamics.inference.regularizers.
     """
 
     def __init__(
@@ -358,74 +498,60 @@ class CovarianceMatricesLayer(layers.Layer):
         m,
         learn,
         initial_value,
+        epsilon,
         regularizer=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.n = n
-        self.m = m
-        self.learn = learn
+        self.epsilon = epsilon
 
         # Bijector used to transform learnable vectors to covariance matrices
         self.bijector = tfb.Chain([tfb.CholeskyOuterProduct(), tfb.FillScaleTriL()])
 
-        # Initialisation of matrices
-        if initial_value is None:
-            self.initial_value = np.array(
-                [np.diag(np.random.normal(1, 0.05, size=m)) for i in range(n)],
-                dtype=np.float32,
-            )
+        # Do we have an initial value?
+        if initial_value is not None:
+            # Check it's the correct shape
+            if initial_value.shape != (n, m, m):
+                raise ValueError(f"initial_value shape must be ({n}, {m}, {m}).")
+
+            # Calculate the flattened cholesky factors
+            initial_value = initial_value.astype("float32")
+            initial_flattened_cholesky_factors = self.bijector.inverse(initial_value)
+
+            # We don't need an initializer
+            initializer = None
         else:
-            if initial_value.ndim != 3:
-                raise ValueError(
-                    "a (n_modes, n_channels, n_channels) array must be passed for "
-                    + "initial_covariances."
+            # No initial value has been passed
+            initial_flattened_cholesky_factors = None
+            if learn:
+                # Use a random initializer
+                initializer = osld_initializers.NormalIdentityCholeskyInitializer(
+                    std=0.1
                 )
-            if initial_value.shape[-1] != m:
-                raise ValueError(
-                    f"mismatch between the number of channels ({m}) and number of "
-                    + "rows/columns in initial_covariances "
-                    + f"({initial_value.shape[-1]})."
-                )
-            if initial_value.shape[0] != n:
-                raise ValueError(
-                    "mismatch bettwen the number of modes and matrices in "
-                    + f"initial_covariances ({initial_value.shape[0]})."
-                )
-            self.initial_value = initial_value.astype("float32")
-        self.initial_flattened_cholesky_factors = self.bijector.inverse(
-            self.initial_value
-        )
-        self.flattened_cholesky_factors_initializer = WeightInitializer(
-            self.initial_flattened_cholesky_factors
-        )
+            else:
+                # Use the identity matrix for each mode/state
+                initializer = osld_initializers.IdentityCholeskyInitializer()
 
-        # Regulariser
-        self.regularizer = regularizer
-
-    def build(self, input_shape):
-        self.flattened_cholesky_factors = self.add_weight(
-            "flattened_cholesky_factors",
-            shape=(self.n, self.m * (self.m + 1) // 2),
-            dtype=tf.float32,
-            initializer=self.flattened_cholesky_factors_initializer,
-            trainable=self.learn,
-        )
-        self.built = True
+        # Create a layer to learn the covariance matrices
+        #
+        # We use self.layers for compatibility with
+        # initializers.reinitialize_model_weights
+        self.layers = [
+            LearnableTensorLayer(
+                shape=(n, m * (m + 1) // 2),
+                learn=learn,
+                initializer=initializer,
+                initial_value=initial_flattened_cholesky_factors,
+                regularizer=regularizer,
+                name=self.name + "_kernel",
+            )
+        ]
 
     def call(self, inputs, **kwargs):
-        covariances = self.bijector(self.flattened_cholesky_factors)
-        if self.regularizer is not None:
-            reg = self.regularizer(covariances)
-
-            # Calculate the the scaling on regularisation
-            batch_size = tf.cast(tf.shape(inputs)[0], tf.float32)
-            n_batches = self.regularizer.n_batches
-            scaling_factor = batch_size * n_batches
-            reg = reg / scaling_factor
-
-            self.add_loss(reg)
-            self.add_metric(reg, name=self.name)
+        learnable_tensor_layer = self.layers[0]
+        flattened_cholesky_factors = learnable_tensor_layer(inputs, **kwargs)
+        covariances = self.bijector(flattened_cholesky_factors)
+        covariances = add_epsilon(covariances, self.epsilon, diag=True)
         return covariances
 
 
@@ -445,8 +571,10 @@ class CorrelationMatricesLayer(layers.Layer):
         Should the matrices be learnable?
     initial_value : np.ndarray
         Initial values for the matrices.
-    regularizer : tf.keras.regularizers.Regularizer
-        Regularizer for matrices.
+    epsilon : float
+        Error added to the diagonal of correlation matrices for numerical stability.
+    regularizer : osl-dynamics regularizer
+        Regularizer for the tensor. Must be from osl_dynamics.inference.regularizers.
     """
 
     def __init__(
@@ -455,80 +583,62 @@ class CorrelationMatricesLayer(layers.Layer):
         m,
         learn,
         initial_value,
+        epsilon,
         regularizer=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.n = n
-        self.m = m
-        self.learn = learn
+        self.epsilon = epsilon
 
         # Bijector used to transform learnable vectors to correlation matrices
         self.bijector = tfb.Chain(
             [tfb.CholeskyOuterProduct(), tfb.CorrelationCholesky()]
         )
 
-        # Initialisation of matrices
-        if initial_value is None:
-            self.initial_value = np.stack([np.eye(m, dtype=np.float32)] * n)
-            self.initial_flattened_cholesky_factors = self.bijector.inverse(
-                self.initial_value
-            )
-            err = np.random.normal(
-                0, 0.05, size=self.initial_flattened_cholesky_factors.shape
-            )
-            self.initial_flattened_cholesky_factors += err
+        # Do we have an initial value?
+        if initial_value is not None:
+            # Check it's the correct shape
+            if initial_value.shape != (n, m, m):
+                raise ValueError(f"initial_value shape must be ({n}, {m}, {m}).")
+
+            # Calculate the flattened cholesky factors
+            initial_value = initial_value.astype("float32")
+            initial_flattened_cholesky_factors = self.bijector.inverse(initial_value)
+
+            # We don't need an initializer
+            initializer = None
         else:
-            if initial_value.ndim != 3:
-                raise ValueError(
-                    "a (n_modes, n_channels, n_channels) array must be passed for "
-                    + "initial_fcs."
+            # No initial value has been passed
+            initial_flattened_cholesky_factors = None
+            if learn:
+                # Use a random initializer
+                initializer = osld_initializers.NormalCorrelationCholeskyInitializer(
+                    std=0.1
                 )
-            if initial_value.shape[-1] != m:
-                raise ValueError(
-                    f"mismatch between the number of channels ({m}) and number of "
-                    + "rows/columns in initial_fcs "
-                    + f"({initial_value.shape[-1]})."
-                )
-            if initial_value.shape[0] != n:
-                raise ValueError(
-                    "mismatch bettwen the number of modes and matrices in "
-                    + f"initial_fcs ({initial_value.shape[0]})."
-                )
-            self.initial_value = initial_value.astype("float32")
-            self.initial_flattened_cholesky_factors = self.bijector.inverse(
-                self.initial_value
+            else:
+                # Use the identity matrix for each mode/state
+                initializer = osld_initializers.IdentityCholeskyInitializer()
+
+        # Create a layer to learn the correlation matrices
+        #
+        # We use self.layers for compatibility with
+        # initializers.reinitialize_model_weights
+        self.layers = [
+            LearnableTensorLayer(
+                shape=(n, m * (m - 1) // 2),
+                learn=learn,
+                initializer=initializer,
+                initial_value=initial_flattened_cholesky_factors,
+                regularizer=regularizer,
+                name=self.name + "_kernel",
             )
-        self.flattened_cholesky_factors_initializer = WeightInitializer(
-            self.initial_flattened_cholesky_factors
-        )
-
-        # Regulariser
-        self.regularizer = regularizer
-
-    def build(self, input_shape):
-        self.flattened_cholesky_factors = self.add_weight(
-            "flattened_cholesky_factors",
-            shape=(self.n, self.m * (self.m - 1) // 2),
-            dtype=tf.float32,
-            initializer=self.flattened_cholesky_factors_initializer,
-            trainable=self.learn,
-        )
-        self.built = True
+        ]
 
     def call(self, inputs, **kwargs):
-        correlations = self.bijector(self.flattened_cholesky_factors)
-        if self.regularizer is not None:
-            reg = self.regularizer(correlations)
-
-            # Calculate the the scaling on regularisation
-            batch_size = tf.cast(tf.shape(inputs)[0], tf.float32)
-            n_batches = self.regularizer.n_batches
-            scaling_factor = batch_size * n_batches
-            reg = reg / scaling_factor
-
-            self.add_loss(reg)
-            self.add_metric(reg, name=self.name)
+        learnable_tensor_layer = self.layers[0]
+        flattened_cholesky_factors = learnable_tensor_layer(inputs, **kwargs)
+        correlations = self.bijector(flattened_cholesky_factors)
+        correlations = add_epsilon(correlations, self.epsilon, diag=True)
         return correlations
 
 
@@ -547,8 +657,10 @@ class DiagonalMatricesLayer(layers.Layer):
         Should the matrices be learnable?
     initial_value : np.ndarray
         Initial values for the matrices.
-    regularizer : tf.keras.regularizers.Regularizer
-        Regularizer for the diagonal entries.
+    epsilon : float
+        Error added to the diagonal matrices for numerical stability.
+    regularizer : osl-dynamics regularizer
+        Regularizer for the tensor. Must be from osl_dynamics.inference.regularizers.
     """
 
     def __init__(
@@ -557,69 +669,64 @@ class DiagonalMatricesLayer(layers.Layer):
         m,
         learn,
         initial_value,
+        epsilon,
         regularizer=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.n = n
-        self.m = m
-        self.learn = learn
+        self.epsilon = epsilon
 
         # Softplus transformation to ensure diagonal is positive
         self.bijector = tfb.Softplus()
 
-        # Initialisation for the diagonals
-        if initial_value is None:
-            self.initial_value = np.random.normal(1, 0.1, size=[n, m]).astype(
-                np.float32
-            )
+        # Do we have an initial value?
+        if initial_value is not None:
+            # Check it's the correct shape
+            if initial_value.shape == (n, m, m):
+                # Keep the diagonal only
+                initial_value = np.diagonal(initial_value, axis1=1, axis2=2)
+            elif initial_value.shape != (n, m):
+                raise ValueError(
+                    f"initial_value shape must be ({n}, {m}, {m}) or ({n}, {m})."
+                )
+
+            # Calculate the initial value of the learnable tensor
+            initial_value = initial_value.astype("float32")
+            initial_diagonals = self.bijector.inverse(initial_value)
+
+            # We don't need an initializer
+            initializer = None
         else:
-            if initial_value.ndim != 2:
-                raise ValueError(
-                    "a (n_modes, n_channels) array must be passed for initial_value."
-                )
-            if initial_value.shape[-1] != m:
-                raise ValueError(
-                    f"mismatch between the number of channels ({m}) and number of "
-                    + f"elements in initial_value ({initial_value.shape[-1]})."
-                )
-            if initial_value.shape[0] != n:
-                raise ValueError(
-                    "mismatch bettwen the number of modes and vectors in "
-                    + f"initial_value ({initial_value.shape[0]})."
-                )
-            self.initial_value = initial_value.astype("float32")
-        self.initial_diagonals = self.bijector.inverse(self.initial_value)
-        self.diagonals_initializer = WeightInitializer(self.initial_diagonals)
+            # No initial value has been passed
+            initial_diagonals = None
+            if learn:
+                # Use a random initializer
+                initializer = osld_initializers.NormalDiagonalInitializer(std=0.05)
+            else:
+                # Use the identity matrix for each mode/state
+                initializer = osld_initializers.IdentityCholeskyInitializer()
 
-        # Regulariser
-        self.regularizer = regularizer
-
-    def build(self, input_shape):
-        self.diagonals = self.add_weight(
-            "diagonals",
-            shape=(self.n, self.m),
-            dtype=tf.float32,
-            initializer=self.diagonals_initializer,
-            trainable=self.learn,
-        )
-        self.built = True
+        # Create a layer to learn the matrices
+        #
+        # We use self.layers for compatibility with
+        # initializers.reinitialize_model_weights
+        self.layers = [
+            LearnableTensorLayer(
+                shape=(n, m),
+                learn=learn,
+                initializer=initializer,
+                initial_value=initial_diagonals,
+                regularizer=regularizer,
+                name=self.name + "_kernel",
+            )
+        ]
 
     def call(self, inputs, **kwargs):
-        D = self.bijector(self.diagonals)
-        if self.regularizer is not None:
-            reg = self.regularizer(D)
-
-            # Calculate the the scaling on regularisation
-            batch_size = tf.cast(tf.shape(inputs)[0], tf.float32)
-            n_batches = self.regularizer.n_batches
-            scaling_factor = batch_size * n_batches
-            reg = reg / scaling_factor
-
-            self.add_loss(reg)
-            self.add_metric(reg, name=self.name)
-        D = tf.linalg.diag(D)
-        return D
+        learnable_tensor_layer = self.layers[0]
+        diagonals = learnable_tensor_layer(inputs, **kwargs)
+        diagonals = self.bijector(diagonals)
+        diagonals = add_epsilon(diagonals, self.epsilon)
+        return tf.linalg.diag(diagonals)
 
 
 class MatrixLayer(layers.Layer):
@@ -635,16 +742,18 @@ class MatrixLayer(layers.Layer):
         Should the matrix be trainable?
     initial_value : np.ndarray
         Initial value for the matrix.
+    epsilon : float
+        Error added to the matrices for numerical stability.
+    regularizer : osl-dynamics regularizer
+        Regularizer for the tensor. Must be from osl_dynamics.inference.regularizers.
     """
 
-    def __init__(self, m, constraint, learn, initial_value, **kwargs):
-
+    def __init__(
+        self, m, constraint, learn, initial_value, epsilon, regularizer=None, **kwargs
+    ):
         super().__init__(**kwargs)
-        self.m = m
         self.constraint = constraint
-        self.learn = learn
 
-        self.initial_value = initial_value
         if initial_value is not None:
             if initial_value.shape[-1] != m:
                 raise ValueError(
@@ -653,14 +762,20 @@ class MatrixLayer(layers.Layer):
             initial_value = initial_value[np.newaxis, ...]
 
         if constraint == "covariance":
-            self.matrix_layer = CovarianceMatricesLayer(1, m, learn, initial_value)
+            self.matrix_layer = CovarianceMatricesLayer(
+                1, m, learn, initial_value, epsilon, regularizer
+            )
         elif constraint == "diagonal":
-            self.matrix_layer = DiagonalMatricesLayer(1, m, learn, initial_value)
+            self.matrix_layer = DiagonalMatricesLayer(
+                1, m, learn, initial_value, epsilon, regularizer
+            )
         else:
             raise ValueError("Please use constraint='diagonal' or 'covariance.'")
 
+        self.layers = [self.matrix_layer]
+
     def call(self, inputs, **kwargs):
-        return self.matrix_layer(inputs)[0]
+        return self.matrix_layer(inputs, **kwargs)[0]
 
 
 class MixVectorsLayer(layers.Layer):
@@ -671,7 +786,6 @@ class MixVectorsLayer(layers.Layer):
     """
 
     def call(self, inputs, **kwargs):
-
         # Unpack the inputs:
         # - alpha.shape = (None, sequence_length, n_modes)
         # - mu.shape    = (n_modes, n_channels)
@@ -681,7 +795,6 @@ class MixVectorsLayer(layers.Layer):
         alpha = tf.expand_dims(alpha, axis=-1)
         mu = tf.expand_dims(tf.expand_dims(mu, axis=0), axis=0)
         m = tf.reduce_sum(tf.multiply(alpha, mu), axis=2)
-
         return m
 
 
@@ -693,7 +806,6 @@ class MixMatricesLayer(layers.Layer):
     """
 
     def call(self, inputs, **kwargs):
-
         # Unpack the inputs:
         # - alpha.shape = (None, sequence_length, n_modes)
         # - D.shape     = (n_modes, n_channels, n_channels)
@@ -703,23 +815,16 @@ class MixMatricesLayer(layers.Layer):
         alpha = tf.expand_dims(tf.expand_dims(alpha, axis=-1), axis=-1)
         D = tf.expand_dims(tf.expand_dims(D, axis=0), axis=0)
         C = tf.reduce_sum(tf.multiply(alpha, D), axis=2)
-
         return C
 
 
-class MixVectorsMatricesLayer(layers.Layer):
-    """Layer to mix vectors and matrices.
-
-    The mixture is calculated as C_u_t.
-    """
+class ConcatVectorsMatricesLayer(layers.Layer):
+    """Layer to concatenate vectors and matrices."""
 
     def call(self, inputs, **kwargs):
-
-        # Unpack the inputs:
         m, C = inputs
         m = tf.expand_dims(m, axis=-1)
         C_m = tf.concat([C, m], axis=3)
-
         return C_m
 
 
@@ -728,10 +833,22 @@ class LogLikelihoodLossLayer(layers.Layer):
 
     The negative log-likelihood is calculated assuming a multivariate normal
     probability density and its value is added to the loss function.
+
+    Parameters
+    ----------
+    epsilon : float
+        Error added to the covariance matrices for numerical stability.
     """
+
+    def __init__(self, epsilon, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
 
     def call(self, inputs):
         x, mu, sigma = inputs
+
+        # Add a small error for numerical stability
+        sigma = add_epsilon(sigma, self.epsilon, diag=True)
 
         # Multivariate normal distribution
         mvn = tfp.distributions.MultivariateNormalTriL(
@@ -798,16 +915,23 @@ class KLDivergenceLayer(layers.Layer):
 
     Parameters
     ----------
+    epsilon : float
+        Error added to the standard deviations for numerical stability.
     clip_start : int
         Index to clip the sequences inputted to this layer.
     """
 
-    def __init__(self, clip_start=0, **kwargs):
+    def __init__(self, epsilon, clip_start=0, **kwargs):
         super().__init__(**kwargs)
         self.clip_start = clip_start
+        self.epsilon = epsilon
 
     def call(self, inputs, **kwargs):
         inference_mu, inference_sigma, model_mu, model_sigma = inputs
+
+        # Add a small error for numerical stability
+        inference_sigma = add_epsilon(inference_sigma, self.epsilon)
+        model_sigma = add_epsilon(model_sigma, self.epsilon)
 
         # The model network predicts one time step into the future compared to
         # the inference network. We clip the sequences to ensure we are comparing
@@ -884,6 +1008,8 @@ class InferenceRNNLayer(layers.Layer):
         Number of units/neurons per layer.
     drop_rate : float
         Dropout rate for the output of each layer.
+    reg : str
+        Regularization for each layer.
     """
 
     def __init__(
@@ -894,6 +1020,7 @@ class InferenceRNNLayer(layers.Layer):
         n_layers,
         n_units,
         drop_rate,
+        reg,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -902,7 +1029,14 @@ class InferenceRNNLayer(layers.Layer):
             self.layers.append(
                 layers.Bidirectional(
                     layer=RNNLayer(
-                        rnn_type, n_units, return_sequences=True, stateful=False
+                        rnn_type,
+                        n_units,
+                        kernel_regularizer=reg,
+                        recurrent_regularizer=reg,
+                        bias_regularizer=reg,
+                        activity_regularizer=reg,
+                        return_sequences=True,
+                        stateful=False,
                     )
                 )
             )
@@ -933,6 +1067,8 @@ class ModelRNNLayer(layers.Layer):
         Number of units/neurons per layer.
     drop_rate : float
         Dropout rate for the output of each layer.
+    reg : str
+        Regularization for each layer.
     """
 
     def __init__(
@@ -943,13 +1079,23 @@ class ModelRNNLayer(layers.Layer):
         n_layers,
         n_units,
         drop_rate,
+        reg,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.layers = []
         for n in range(n_layers):
             self.layers.append(
-                RNNLayer(rnn_type, n_units, return_sequences=True, stateful=False)
+                RNNLayer(
+                    rnn_type,
+                    n_units,
+                    kernel_regularizer=reg,
+                    recurrent_regularizer=reg,
+                    bias_regularizer=reg,
+                    activity_regularizer=reg,
+                    return_sequences=True,
+                    stateful=False,
+                )
             )
             self.layers.append(NormalizationLayer(norm_type))
             self.layers.append(layers.Activation(act_type))
@@ -1003,25 +1149,36 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
     Parameters
     ----------
     n_states : int
-        Number of states
+        Number of states.
+    epsilon : float
+        Error added to the covariances for numerical stability.
     """
 
-    def __init__(self, n_states, **kwargs):
+    def __init__(self, n_states, epsilon, **kwargs):
         super().__init__(**kwargs)
         self.n_states = n_states
+        self.epsilon = epsilon
 
     def call(self, inputs, **kwargs):
-        x, mu, sigma, probs = inputs
+        x, mu, sigma, probs, subj_id = inputs
+        # Add a small error for numerical stability
+        sigma = add_epsilon(sigma, self.epsilon, diag=True)
+
+        if subj_id is not None:
+            subj_id = tf.cast(subj_id, tf.int32)
+            mu = tf.gather(mu, subj_id)
+            sigma = tf.gather(sigma, subj_id)
 
         # Log-likelihood for each state
         ll_loss = tf.zeros(shape=tf.shape(x)[:-1])
         for i in range(self.n_states):
             mvn = tfp.distributions.MultivariateNormalTriL(
-                loc=mu[i],
-                scale_tril=tf.linalg.cholesky(sigma[i]),
+                loc=tf.gather(mu, i, axis=-2),
+                scale_tril=tf.linalg.cholesky(tf.gather(sigma, i, axis=-3)),
                 allow_nan_stats=False,
             )
-            ll_loss += probs[:, :, i] * mvn.log_prob(x)
+            a = mvn.log_prob(x)
+            ll_loss += probs[:, :, i] * a
 
         # Sum over time dimension and average over the batch dimension
         ll_loss = tf.reduce_sum(ll_loss, axis=1)
@@ -1035,48 +1192,26 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
         return tf.expand_dims(nll_loss, axis=-1)
 
 
-class SubjectDevEmbeddingLayer(layers.Layer):
+class ConcatEmbeddingsLayer(layers.Layer):
     """Layer for getting the concatenated embeddings.
 
     The concatenated embeddings are obtained by concatenating subject embeddings
-    and mode spatial map embeddings. The concatenated embeddings are used to
-    generate subject specific deviations from the group spatial map.
-
-    Parameters
-    ----------
-    n_modes : int
-        Number of modes.
-    n_channels: int
-        Number of channels.
-    n_subjects : int
-        Number of subjects.
+    and mode spatial map embeddings.
     """
-
-    def __init__(
-        self,
-        n_modes,
-        n_channels,
-        n_subjects,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.n_modes = n_modes
-        self.n_channels = n_channels
-        self.n_subjects = n_subjects
 
     def call(self, inputs):
         subject_embeddings, mode_embeddings = inputs
-        subject_embedding_dim = subject_embeddings.shape[-1]
-        mode_embedding_dim = mode_embeddings.shape[-1]
+        n_subjects, subject_embedding_dim = subject_embeddings.shape
+        n_modes, mode_embedding_dim = mode_embeddings.shape
 
         # Match dimensions for concatenation
         subject_embeddings = tf.broadcast_to(
             tf.expand_dims(subject_embeddings, axis=1),
-            [self.n_subjects, self.n_modes, subject_embedding_dim],
+            [n_subjects, n_modes, subject_embedding_dim],
         )
         mode_embeddings = tf.broadcast_to(
             tf.expand_dims(mode_embeddings, axis=0),
-            [self.n_subjects, self.n_modes, mode_embedding_dim],
+            [n_subjects, n_modes, mode_embedding_dim],
         )
 
         # Concatenate the embeddings
@@ -1094,33 +1229,37 @@ class SubjectMapLayer(layers.Layer):
     ----------
     which_map : str
         Which spatial map are we using? Must be one of 'means' and 'covariances'.
+    epsilon : float
+        Error added to the diagonal of covariances for numerical stability.
     """
 
-    def __init__(self, which_map, **kwargs):
+    def __init__(self, which_map, epsilon, **kwargs):
         super().__init__(**kwargs)
         self.which_map = which_map
+        self.epsilon = epsilon
         if which_map == "covariances":
             self.bijector = tfb.Chain([tfb.CholeskyOuterProduct(), tfb.FillScaleTriL()])
-        elif which_map != "means":
+        elif which_map == "means":
+            self.bijector = tfb.Identity()
+        else:
             raise ValueError("which_map must be one of 'means' and 'covariances'.")
 
     def call(self, inputs):
         group_map, dev = inputs
-
-        if self.which_map == "covariances":
-            group_map = self.bijector.inverse(group_map)
+        group_map = self.bijector.inverse(group_map)
 
         # Match dimensions for addition
         group_map = tf.expand_dims(group_map, axis=0)
         subject_map = tf.add(group_map, dev)
+        subject_map = self.bijector(subject_map)
 
         if self.which_map == "covariances":
-            subject_map = self.bijector(subject_map)
+            subject_map = add_epsilon(subject_map, self.epsilon, diag=True)
 
         return subject_map
 
 
-class MixSubjectEmbeddingParametersLayer(layers.Layer):
+class MixSubjectSpecificParametersLayer(layers.Layer):
     """Class for mixing means and covariances for the
     subject embedding model.
 
@@ -1131,10 +1270,11 @@ class MixSubjectEmbeddingParametersLayer(layers.Layer):
     """
 
     def call(self, inputs):
-        # alpha.shape = (None, sequence_length, n_modes)
-        # mu.shape = (n_subjects, n_modes, n_channels)
-        # D.shape = (n_subjects, n_modes, n_channels, n_channels)
-        # subj_id.shape = (None, sequence_length)
+        # Unpack inputs:
+        # - alpha.shape   = (None, sequence_length, n_modes)
+        # - mu.shape      = (n_subjects, n_modes, n_channels)
+        # - D.shape       = (n_subjects, n_modes, n_channels, n_channels)
+        # - subj_id.shape = (None, sequence_length)
         alpha, mu, D, subj_id = inputs
         subj_id = tf.cast(subj_id, tf.int32)
 
@@ -1152,28 +1292,110 @@ class MixSubjectEmbeddingParametersLayer(layers.Layer):
         return m, C
 
 
-class SubjectMapKLDivergenceLayer(layers.Layer):
-    """Layer to calculate KL divergence between posterior and prior of
-    subject specific deviation.
+class StaticKLDivergenceLayer(layers.Layer):
+    """Layer to calculate KL divergence between Gamma posterior
+    and exponential prior for static parameters.
+
+    Parameters
+    ----------
+    epsilon : float
+        Error added to the standard deviations for numerical stability.
+    n_batches : int
+        Number of batches in the data. This is for calculating
+        the scaling factor.
     """
 
-    def __init__(self, n_batches=1, **kwargs):
+    def __init__(self, epsilon, n_batches=1, **kwargs):
         super().__init__(**kwargs)
+        self.epsilon = epsilon
         self.n_batches = n_batches
 
     def call(self, inputs, **kwargs):
-        data, inference_mu, inference_sigma, model_sigma = inputs
+        data, inference_alpha, inference_beta, model_beta = inputs
 
-        prior = tfp.distributions.Normal(loc=0.0, scale=model_sigma)
-        posterior = tfp.distributions.Normal(loc=inference_mu, scale=inference_sigma)
+        # Add a small error for numerical stability
+        inference_alpha = add_epsilon(inference_alpha, self.epsilon)
+        inference_beta = add_epsilon(inference_beta, self.epsilon)
+        model_beta = add_epsilon(model_beta, self.epsilon)
+
+        # Calculate the KL divergence
+        prior = tfp.distributions.Exponential(rate=model_beta)
+        posterior = tfp.distributions.Gamma(
+            concentration=inference_alpha, rate=inference_beta
+        )
         kl_loss = tfp.distributions.kl_divergence(
             posterior, prior, allow_nan_stats=False
         )
+
         # Calculate the scaling for KL loss
         batch_size = tf.cast(tf.shape(data)[0], tf.float32)
         scaling_factor = batch_size * self.n_batches
-        kl_loss = kl_loss / scaling_factor
+        kl_loss /= scaling_factor
 
         kl_loss = tf.reduce_sum(kl_loss)
 
         return kl_loss
+
+
+class MultiLayerPerceptronLayer(layers.Layer):
+    """Multi-Layer Perceptron layer.
+
+    Parameters
+    ----------
+    n_layers : int
+        Number of layers.
+    n_units : int
+        Number of units/neurons.
+    norm_type : str
+        Normalization layer type. Can be None, "layer" or "batch".
+    act_type : str
+        Activation type.
+    drop_rate : float
+        Dropout rate.
+    regularizer : str
+        Regularizer type.
+    regularizer_factor : float
+        Regularizer factor.
+    """
+
+    def __init__(
+        self,
+        n_layers,
+        n_units,
+        norm_type,
+        act_type,
+        drop_rate,
+        regularizer=None,
+        regularizer_factor=0.0,
+        n_batches=1,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.regularizer = regularizers.get(regularizer)
+        self.regularizer_factor = regularizer_factor
+        self.n_batches = n_batches
+        self.layers = []
+        for _ in range(n_layers):
+            self.layers.append(layers.Dense(n_units))
+            self.layers.append(NormalizationLayer(norm_type))
+            self.layers.append(layers.Activation(act_type))
+            self.layers.append(layers.Dropout(drop_rate))
+
+    def call(self, inputs, training=None, **kwargs):
+        reg = 0.0
+        data, inputs = inputs
+
+        batch_size = tf.cast(tf.shape(data)[0], tf.float32)
+        scaling_factor = batch_size * self.n_batches
+        for layer in self.layers:
+            inputs = layer(inputs, **kwargs)
+            if self.regularizer is not None and isinstance(layer, layers.Dense):
+                reg += self.regularizer(layer.kernel)
+                reg += self.regularizer(layer.bias)
+
+        if self.regularizer is not None and training:
+            reg *= self.regularizer_factor
+            reg /= scaling_factor
+            self.add_loss(reg)
+            self.add_metric(reg, name=self.name)
+        return inputs

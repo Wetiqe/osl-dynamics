@@ -2,29 +2,31 @@
 
 """
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
-import tensorflow as tf
 from tensorflow.keras import layers, models, optimizers, utils
-from tqdm import trange
+from tqdm.auto import trange
 
+from osl_dynamics.inference.layers import (
+    AdversarialLogLikelihoodLossLayer,
+    ConcatVectorsMatricesLayer,
+    CorrelationMatricesLayer,
+    DiagonalMatricesLayer,
+    InferenceRNNLayer,
+    MatMulLayer,
+    MixMatricesLayer,
+    MixVectorsLayer,
+    ModelRNNLayer,
+    VectorsLayer,
+)
 from osl_dynamics.models import mdynemo_obs
 from osl_dynamics.models.mod_base import BaseModelConfig, ModelBase
-from osl_dynamics.inference.layers import (
-    InferenceRNNLayer,
-    MeanVectorsLayer,
-    DiagonalMatricesLayer,
-    CorrelationMatricesLayer,
-    MixVectorsLayer,
-    MixMatricesLayer,
-    MatMulLayer,
-    ModelRNNLayer,
-    MixVectorsMatricesLayer,
-    AdversarialLogLikelihoodLossLayer,
-)
+
+_logger = logging.getLogger("osl-dynamics")
 
 
 @dataclass
@@ -33,6 +35,8 @@ class Config(BaseModelConfig):
 
     Parameters
     ----------
+    model_name : str
+        Model name.
     n_modes : int
         Number of modes.
     n_channels : int
@@ -53,6 +57,8 @@ class Config(BaseModelConfig):
         E.g. 'relu', 'elu', etc.
     inference_dropout : float
         Dropout rate.
+    inference_regularizer : str
+        Regularizer.
 
     model_rnn : str
         RNN to use, either 'gru' or 'lstm'.
@@ -67,6 +73,8 @@ class Config(BaseModelConfig):
         E.g. 'relu', 'elu', etc.
     model_dropout : float
         Dropout rate.
+    model_regularizer : str
+        Regularizer.
 
     discriminator_rnn : str
         RNN to use, either 'gru' or 'lstm'.
@@ -81,6 +89,8 @@ class Config(BaseModelConfig):
         E.g. 'relu', 'elu', etc.
     discriminator_dropout : float
         Dropout rate.
+    discriminator_regularizer : str
+        Regularizer.
 
     learn_means : bool
         Should we make the mean vectors for each mode trainable?
@@ -90,6 +100,10 @@ class Config(BaseModelConfig):
         Initialisation for mean vectors.
     initial_covariances : np.ndarray
         Initialisation for mode covariances.
+    stds_epsilon : float
+        Error added to mode stds for numerical stability.
+    fcs_epsilon : float
+        Error added to mode fcs for numerical stability.
 
     batch_size : int
         Mini-batch size.
@@ -105,6 +119,8 @@ class Config(BaseModelConfig):
         Strategy for distributed learning.
     """
 
+    model_name: str = "MAGE"
+
     # Inference network parameters
     inference_rnn: Literal["gru", "lstm"] = "lstm"
     inference_n_layers: int = 1
@@ -112,6 +128,7 @@ class Config(BaseModelConfig):
     inference_normalization: Literal[None, "batch", "layer"] = None
     inference_activation: str = "elu"
     inference_dropout: float = 0.0
+    inference_regularizer: str = None
 
     # Model network parameters
     model_rnn: Literal["gru", "lstm"] = "lstm"
@@ -120,6 +137,7 @@ class Config(BaseModelConfig):
     model_normalization: Literal[None, "batch", "layer"] = None
     model_activation: str = "elu"
     model_dropout: float = 0.0
+    model_regularizer: str = None
 
     # Descriminator network parameters
     discriminator_rnn: Literal["gru", "lstm"] = "lstm"
@@ -128,6 +146,7 @@ class Config(BaseModelConfig):
     discriminator_normalization: Literal[None, "batch", "layer"] = None
     discriminator_activation: str = "elu"
     discriminator_dropout: float = 0.0
+    discriminator_regularizer: str = None
 
     # Observation model parameters
     learn_means: bool = None
@@ -136,6 +155,8 @@ class Config(BaseModelConfig):
     initial_means: np.ndarray = None
     initial_stds: np.ndarray = None
     initial_fcs: np.ndarray = None
+    stds_epsilon: float = None
+    fcs_epsilon: float = None
     multiple_dynamics: bool = True
 
     def __post_init__(self):
@@ -162,6 +183,18 @@ class Config(BaseModelConfig):
         ):
             raise ValueError("learn_means, learn_stds and learn_fcs must be passed.")
 
+        if self.stds_epsilon is None:
+            if self.learn_stds:
+                self.stds_epsilon = 1e-6
+            else:
+                self.stds_epsilon = 0.0
+
+        if self.fcs_epsilon is None:
+            if self.learn_fcs:
+                self.fcs_epsilon = 1e-6
+            else:
+                self.fcs_epsilon = 0.0
+
 
 class Model(ModelBase):
     """MAGE model class.
@@ -171,11 +204,13 @@ class Model(ModelBase):
     config : osl_dynamics.models.mage.Config
     """
 
+    config_type = Config
+
     def build_model(self):
         """Builds a keras model for the inference, generator and discriminator model
         and the full MAGE model.
         """
-        print("Build models")
+        _logger.info("Build models")
         self.inference_model = _build_inference_model(self.config)
         self.inference_model.summary()
         print()
@@ -264,13 +299,13 @@ class Model(ModelBase):
             optimizer=optimizer,
         )
 
-    def fit(self, train_data: tf.data.Dataset, epochs: int = None, verbose: int = 1):
+    def fit(self, training_data, epochs=None, verbose=1):
         """Train the model.
 
         Parameters
         ----------
-        train_data : tensorflow.data.Dataset
-            Training dataset.
+        training_data : tensorflow.data.Dataset or osl_dynamics.data.Data
+            Training data.
         epochs : int
             Number of epochs to train. Defaults to value in config if not passed.
         verbose : int
@@ -284,6 +319,9 @@ class Model(ModelBase):
         if epochs is None:
             epochs = self.config.n_epochs
 
+        # Make sure training data is a TensorFlow Dataset
+        training_data = self.make_dataset(training_data, shuffle=True, concatenate=True)
+
         # Path to save the best model weights
         timestr = time.strftime("%Y%m%d-%H%M%S")  # current date-time
         filepath = "tmp/"
@@ -295,10 +333,10 @@ class Model(ModelBase):
             if verbose:
                 print("Epoch {}/{}".format(epoch + 1, epochs))
                 pb_i = utils.Progbar(
-                    len(train_data), stateful_metrics=["D_m", "D_c", "G"]
+                    len(training_data), stateful_metrics=["D_m", "D_c", "G"]
                 )
 
-            for idx, batch in enumerate(train_data):
+            for idx, batch in enumerate(training_data):
                 # Generate real/fake input for the discriminator
                 real = np.ones((len(batch["data"]), self.config.sequence_length, 1))
                 fake = np.zeros((len(batch["data"]), self.config.sequence_length, 1))
@@ -340,7 +378,7 @@ class Model(ModelBase):
 
             if generator_loss[0] < best_val_loss:
                 self.save_weights(save_filepath)
-                print(
+                _logger.info(
                     "Best model w/ val loss (generator) {} saved to {}".format(
                         generator_loss[0], save_filepath
                     )
@@ -357,7 +395,7 @@ class Model(ModelBase):
             )
 
         # Load the weights for the best model
-        print("Loading best model:", save_filepath)
+        _logger.info(f"Loading best model: {save_filepath}")
         self.load_weights(save_filepath)
 
         return history
@@ -376,7 +414,7 @@ class Model(ModelBase):
     def get_mode_time_courses(
         self,
         inputs,
-        concatenate=True,
+        concatenate=False,
     ):
         """Get mode time courses.
 
@@ -384,8 +422,8 @@ class Model(ModelBase):
 
         Parameters
         ----------
-        inputs : tensorflow.data.Dataset
-            Prediction dataset.
+        inputs : tensorflow.data.Dataset or osl_dynamics.data.Data
+            Prediction data.
         concatenate : bool
             Should we concatenate alpha for each subject?
 
@@ -401,9 +439,11 @@ class Model(ModelBase):
         if not self.config.multiple_dynamics:
             raise ValueError("Please use get_alpha for a single time scale model.")
 
+        inputs = self.make_dataset(inputs, concatenate=concatenate)
+
+        _logger.info("Getting mode time courses:")
         outputs_alpha = []
         outputs_gamma = []
-
         for dataset in inputs:
             alpha, gamma = self.inference_model.predict(dataset)[1:]
 
@@ -444,7 +484,6 @@ class Model(ModelBase):
         for i in trange(
             n_samples - self.config.sequence_length,
             desc="Predicting mode time course",
-            ncols=98,
         ):
             # Extract the sequence
             alpha_input = alpha[i : i + self.config.sequence_length]
@@ -518,6 +557,7 @@ def _build_inference_model(config):
         config.inference_n_layers,
         config.inference_n_units,
         config.inference_dropout,
+        config.inference_regularizer,
         name="inf_rnn",
     )
 
@@ -542,7 +582,7 @@ def _build_inference_model(config):
     #   and the observation model.
 
     # Definition of layers
-    means_layer = MeanVectorsLayer(
+    means_layer = VectorsLayer(
         config.n_modes,
         config.n_channels,
         config.learn_means,
@@ -555,6 +595,7 @@ def _build_inference_model(config):
         config.n_channels,
         config.learn_stds,
         config.initial_stds,
+        config.stds_epsilon,
         name="stds",
     )
 
@@ -563,6 +604,7 @@ def _build_inference_model(config):
         config.n_channels,
         config.learn_fcs,
         config.initial_fcs,
+        config.fcs_epsilon,
         name="fcs",
     )
 
@@ -570,7 +612,7 @@ def _build_inference_model(config):
     mix_stds_layer = MixMatricesLayer(name="mix_stds")
     mix_fcs_layer = MixMatricesLayer(name="mix_fcs")
     matmul_layer = MatMulLayer(name="cov")
-    mix_means_covs_layer = MixVectorsMatricesLayer(name="mix_means_covs")
+    concat_means_covs_layer = ConcatVectorsMatricesLayer(name="concat_means_covs")
 
     # Data flow
     mu = means_layer(inputs)  # inputs not used
@@ -581,7 +623,7 @@ def _build_inference_model(config):
     G = mix_stds_layer([alpha, E])
     F = mix_fcs_layer([gamma, D])
     C = matmul_layer([G, F, G])
-    C_m = mix_means_covs_layer([m, C])
+    C_m = concat_means_covs_layer([m, C])
 
     return models.Model(inputs, [C_m, alpha, gamma], name="inference")
 
@@ -609,6 +651,7 @@ def _build_generator_model(config, name):
         config.model_n_layers,
         config.model_n_units,
         config.model_dropout,
+        config.model_regularizer,
         name="gen_rnn_" + name,
     )
     prior_layer = layers.TimeDistributed(
@@ -643,6 +686,7 @@ def _build_discriminator_model(config, name):
         config.discriminator_n_layers,
         config.discriminator_n_units,
         config.discriminator_dropout,
+        config.discriminator_regularizer,
         name="dis_rnn_" + name,
     )
     sigmoid_layer = layers.TimeDistributed(

@@ -1,227 +1,68 @@
-"""Classes and functions for reading and writing data.
+"""Functions for reading and writing data.
 
 """
 
-import pathlib
-import pickle
+import logging
 import warnings
 from os import listdir, path
-from shutil import rmtree
 
+import mne
 import mat73
 import numpy as np
 import scipy.io
-from tqdm import tqdm
+
 from osl_dynamics.data import spm
 
+_logger = logging.getLogger("osl-dynamics")
+_allowed_ext = [".npy", ".mat", ".txt", ".fif"]
 
-class RW:
-    """Class for reading/writing data.
+
+def validate_inputs(inputs):
+    """Validates inputs.
 
     Parameters
     ----------
-    inputs : list of str or str
-        Filenames to be read.
-    data_field : str
-        If a MATLAB filename is passed, this is the field that corresponds to the
-        data. By default we read the field 'X'.
-    sampling_frequency : float
-        Sampling frequency of the data in Hz.
-    store_dir : str
-        Directory to save results and intermediate steps to. Default is /tmp.
-    time_axis_first : bool
-        Is the input data of shape (n_samples, n_channels)?
-    load_memmaps: bool
-        Should we load the data into the memmaps?
-    keep_memmaps_on_close : bool
-        Should we keep the memmaps?
+    inputs : list of str or str or np.ndarray
+        Inputs files or data.
+
+    Returns
+    -------
+    validated_inputs : list of str or str
+        Validated inputs.
     """
-
-    def __init__(
-        self,
-        inputs,
-        data_field,
-        sampling_frequency,
-        store_dir,
-        time_axis_first,
-        load_memmaps=True,
-        keep_memmaps_on_close=False,
-    ):
-        self.keep_memmaps_on_close = keep_memmaps_on_close
-        self.load_memmaps = load_memmaps
-
-        # Validate inputs
-        if isinstance(inputs, str):
-            if path.isdir(inputs):
-                self.inputs = list_dir(inputs, keep_ext=[".npy", ".mat", ".txt"])
-            else:
-                self.inputs = [inputs]
-
-        elif isinstance(inputs, np.ndarray):
-            if inputs.ndim == 1:
-                self.inputs = [inputs[:, np.newaxis]]
-            elif inputs.ndim == 2:
-                self.inputs = [inputs]
-            else:
-                self.inputs = inputs
-
-        elif isinstance(inputs, list):
-            if len(inputs) == 0:
-                raise ValueError("Empty list passed.")
-            elif isinstance(inputs[0], str):
-                self.inputs = []
-                for inp in inputs:
-                    if path.isdir(inp):
-                        self.inputs += list_dir(inp, keep_ext=[".npy", ".mat", ".txt"])
-                    else:
-                        self.inputs.append(inp)
-            else:
-                self.inputs = inputs
-
-        else:
-            raise ValueError("inputs must be str, np.ndarray or list.")
-
-        if len(self.inputs) == 0:
-            raise ValueError("No valid inputs were passed.")
-
-        # Directory to store memory maps created by this class
-        self.store_dir = pathlib.Path(store_dir)
-        self.store_dir.mkdir(parents=True, exist_ok=True)
-
-        # Load and validate the raw data
-        self.raw_data_memmaps, self.raw_data_filenames = self.load_raw_data(
-            data_field, time_axis_first
-        )
-        self.validate_data()
-
-        # Get data prepration attributes if the raw data has been prepared
-        if not isinstance(inputs, list):
-            self.load_preparation(inputs)
-
-        # Attributes describing the raw data
-        self.n_raw_data_channels = self.raw_data_memmaps[0].shape[-1]
-        self.sampling_frequency = sampling_frequency
-
-        # Use raw data for the subject data
-        self.subjects = self.raw_data_memmaps
-
-    def delete_dir(self):
-        """Deletes store_dir."""
-        if self.store_dir.exists():
-            rmtree(self.store_dir)
-
-    def delete_io_memmaps(self):
-        """Deletes memmaps and removes store_dir if empty."""
-        if hasattr(self, "raw_data_filenames"):
-            if self.raw_data_filenames is not None:
-                for filename in self.raw_data_filenames:
-                    pathlib.Path(filename).unlink(missing_ok=True)
-            if self.store_dir.exists():
-                if not any(self.store_dir.iterdir()):
-                    self.store_dir.rmdir()
-            self.raw_data_memmaps = None
-            self.raw_data_filenames = None
-
-    def load_preparation(self, inputs):
-        """Loads a pickle file containing preparation settings.
-
-        Parameters
-        ----------
-        inputs : str
-            Path to directory containing the pickle file with preparation settings.
-        """
+    if isinstance(inputs, str):
         if path.isdir(inputs):
-            for file in list_dir(inputs):
-                if "preparation.pkl" in file:
-                    preparation = pickle.load(open(inputs + "/preparation.pkl", "rb"))
-                    self.amplitude_envelope = preparation["amplitude_envelope"]
-                    self.n_window = preparation["n_window"]
-                    self.n_embeddings = preparation["n_embeddings"]
-                    self.n_te_channels = preparation["n_te_channels"]
-                    self.n_pca_components = preparation["n_pca_components"]
-                    self.pca_components = preparation["pca_components"]
-                    self.whiten = preparation["whiten"]
-                    self.prepared = True
+            validated_inputs = list_dir(inputs, keep_ext=_allowed_ext)
+        else:
+            validated_inputs = [inputs]
 
-    def load_raw_data(
-        self,
-        data_field,
-        time_axis_first,
-    ):
-        """Import data into a list of memory maps.
+    elif isinstance(inputs, np.ndarray):
+        if inputs.ndim == 1:
+            validated_inputs = [inputs[:, np.newaxis]]
+        elif inputs.ndim == 2:
+            validated_inputs = [inputs]
+        else:
+            validated_inputs = inputs
 
-        Parameters
-        ----------
-        data_field : str
-            If a MATLAB filename is passed, this is the field that corresponds
-            to the data. By default we read the field 'X'.
-        time_axis_first : bool
-            Is the input data of shape (n_samples, n_channels)?
+    elif isinstance(inputs, list):
+        if len(inputs) == 0:
+            raise ValueError("Empty list passed.")
+        elif isinstance(inputs[0], str):
+            validated_inputs = []
+            for inp in inputs:
+                if path.isdir(inp):
+                    validated_inputs += list_dir(inp, keep_ext=_allowed_ext)
+                elif path.exists(inp):
+                    validated_inputs.append(inp)
+                else:
+                    _logger.warn(f"{inp} not found")
+        else:
+            validated_inputs = inputs
 
-        Returns
-        -------
-        list
-            list of np.memmap.
-        """
-        raw_data_pattern = "raw_data_{{i:0{width}d}}_{identifier}.npy".format(
-            width=len(str(len(self.inputs))), identifier=self._identifier
-        )
-        raw_data_filenames = [
-            str(self.store_dir / raw_data_pattern.format(i=i))
-            for i in range(len(self.inputs))
-        ]
-        # self.raw_data_filenames is not used if self.inputs is a list of strings,
-        # where the strings are paths to .npy files
+    else:
+        raise ValueError("inputs must be str, np.ndarray or list.")
 
-        memmaps = []
-        for raw_data, mmap_location in zip(
-            tqdm(self.inputs, desc="Loading files", ncols=98), raw_data_filenames
-        ):
-            if not self.load_memmaps:  # do not load into the memory maps
-                mmap_location = None
-            raw_data_mmap = load_data(
-                raw_data, data_field, mmap_location, mmap_mode="r"
-            )
-            if not time_axis_first:
-                raw_data_mmap = raw_data_mmap.T
-            memmaps.append(raw_data_mmap)
-
-        return memmaps, raw_data_filenames
-
-    def save(self, output_dir="."):
-        """Saves data to numpy files.
-
-        Parameters
-        ----------
-        output_dir : str
-            Path to save data files to. Default is the current working
-            directory.
-        """
-        output_dir = pathlib.Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save time series data
-        for i in tqdm(range(self.n_subjects), desc="Saving data", ncols=98):
-            np.save(f"{output_dir}/subject{i}.npy", self.subjects[i])
-
-        # Save preparation info if .prepared has been called
-        if self.prepared:
-            preparation = {
-                "amplitude_envelope": self.amplitude_envelope,
-                "n_window": self.n_window,
-                "n_embeddings": self.n_embeddings,
-                "n_te_channels": self.n_te_channels,
-                "n_pca_components": self.n_pca_components,
-                "pca_components": self.pca_components,
-                "whiten": self.whiten,
-            }
-            pickle.dump(preparation, open(f"{output_dir}/preparation.pkl", "wb"))
-
-    def validate_data(self):
-        """Validate data files."""
-        n_channels = [memmap.shape[-1] for memmap in self.raw_data_memmaps]
-        if not np.equal(n_channels, n_channels[0]).all():
-            raise ValueError("All inputs should have the same number of channels.")
+    return validated_inputs
 
 
 def file_ext(filename):
@@ -270,20 +111,27 @@ def list_dir(path, keep_ext=None):
 def load_data(
     data,
     data_field="X",
+    picks=None,
+    reject_by_annotation=None,
     mmap_location=None,
     mmap_mode="r+",
 ):
     """Loads time series data.
 
-    Checks the data shape is time by channel and that the data is float32.
+    Checks the data shape is time by channels and that the data is float32.
 
     Parameters
     ----------
     data : numpy.ndarray or str or list
-        An array or filename of a .npy, .txt, or .mat file containing the data.
+        An array or path to a .npy, .mat, .txt or .fif file containing the data.
     data_field : str
         If a MATLAB filename is passed, this is the field that corresponds to
         the data.
+    picks : str or list of str
+        Argument passed to mne.Raw.get_data() or mne.Epochs.get_data().
+        Only used if a fif file is passed.
+    reject_by_annotation : str
+        Argument passed to mne.Raw.get_data(). Only used if a fif file is passed.
     mmap_location : str
         Filename to save the data as a numpy memory map.
     mmap_mode : str
@@ -310,8 +158,8 @@ def load_data(
 
         # Check extension
         ext = file_ext(data)
-        if ext not in [".npy", ".mat", ".txt"]:
-            raise ValueError("Data file must be .npy, .txt or .mat.")
+        if ext not in _allowed_ext:
+            raise ValueError(f"Data file must have extension: {_allowed_ext}.")
 
         # Load a MATLAB file
         if ext == ".mat":
@@ -343,9 +191,55 @@ def load_data(
                 np.save(mmap_location, data)
                 data = mmap_location
 
+        # Load a fif file
+        elif ext == ".fif":
+            data = load_fif(data, picks, reject_by_annotation)
+            data = data.astype(np.float32)
+            if mmap_location is None:
+                return data
+            else:
+                np.save(mmap_location, data)
+                data = mmap_location
+
     # Load data as memmap
     data = np.load(mmap_location, mmap_mode=mmap_mode)
+    data = data.astype(np.float32)
 
+    return data
+
+
+def load_fif(filename, picks=None, reject_by_annotation=None):
+    """Load a fif file.
+
+    Parameters
+    ----------
+    filename : str
+        Path to fif file. Must end with 'raw.fif' or 'epo.fif'.
+    picks : str or list of str
+        Argument passed to mne.Raw.get_data() or mne.Epochs.get_data().
+    reject_by_annotation : str
+        Argument passed to mne.Raw.get_data() if filename contains 'raw.fif'.
+
+    Returns
+    -------
+    data : np.ndarray
+        Time series data in format (n_samples, n_channels).
+        If an mne.Epochs fif file is pass ('epo.fif') the we
+        concatenate the epochs in the first axis.
+    """
+    if "raw.fif" in filename:
+        raw = mne.io.read_raw_fif(filename, verbose=False)
+        data = raw.get_data(
+            picks=picks,
+            reject_by_annotation=reject_by_annotation,
+            verbose=False,
+        ).T
+    elif "epo.fif" in filename:
+        epochs = mne.read_epochs(filename, verbose=False)
+        data = epochs.get_data(picks=picks)
+        data = np.swapaxes(data, 1, 2).reshape(-1, data.shape[1])
+    else:
+        raise ValueError(f"a fif file must end with 'raw.fif' or 'epo.fif'.")
     return data
 
 

@@ -2,9 +2,14 @@
 
 """
 
-from tensorflow.keras import Model, layers
+import numpy as np
+import tensorflow_probability as tfp
+import tensorflow as tf
+from tensorflow.keras import Model, layers, initializers
 from tensorflow.keras.initializers import Initializer
 from osl_dynamics import inference
+
+tfb = tfp.bijectors
 
 
 class WeightInitializer(Initializer):
@@ -22,6 +27,103 @@ class WeightInitializer(Initializer):
 
     def __call__(self, shape, dtype=None):
         return self.initial_value
+
+
+class IdentityCholeskyInitializer(Initializer):
+    """Initialize weights to a flattened cholesky factor of identity matrices."""
+
+    def __init__(self):
+        # Bijector used to transform learnable vectors to covariance matrices
+        self.bijector = tfb.Chain([tfb.CholeskyOuterProduct(), tfb.FillScaleTriL()])
+
+    def __call__(self, shape, dtype=None):
+        n = shape[0]  # n_modes
+        m = int(np.sqrt(1 + 8 * shape[1]) / 2 - 0.5)  # n_channels
+        diagonals = np.ones([n, m])
+        matrices = np.array([np.diag(d) for d in diagonals], dtype=np.float32)
+        return self.bijector.inverse(matrices)
+
+
+class NormalIdentityCholeskyInitializer(Initializer):
+    """Initialize weights to a flattened cholesky factor of identity
+    matrices with a normal error added to the diagonal.
+
+    Parameters
+    ----------
+    std : float
+        Standard deviation of the error to add.
+    """
+
+    def __init__(self, std):
+        self.std = std
+
+        # Bijector used to transform learnable vectors to covariance matrices
+        self.bijector = tfb.Chain([tfb.CholeskyOuterProduct(), tfb.FillScaleTriL()])
+
+    def __call__(self, shape, dtype=None):
+        n = shape[0]  # n_modes
+        m = int(np.sqrt(1 + 8 * shape[1]) / 2 - 0.5)  # n_channels
+        diagonals = initializers.TruncatedNormal(mean=1, stddev=self.std).__call__(
+            shape=(n, m), dtype=tf.float32
+        )
+        matrices = np.array([np.diag(d) for d in diagonals], dtype=np.float32)
+        return self.bijector.inverse(matrices)
+
+
+class NormalCorrelationCholeskyInitializer(Initializer):
+    """Initialize weights to a flattened cholesky factor of correlation
+    matrices with a normal error added to the flattened cholesky factor.
+
+    Parameters
+    ----------
+    mean : float
+        Mean of the error to add.
+    std : float
+        Standard deviation of the error to add.
+    """
+
+    def __init__(self, std):
+        self.std = std
+
+        # Bijector used to transform learnable vectors to covariance matrices
+        self.bijector = tfb.Chain(
+            [tfb.CholeskyOuterProduct(), tfb.CorrelationCholesky()]
+        )
+
+    def __call__(self, shape, dtype=None):
+        n = shape[0]  # n_modes
+        m = int(np.sqrt(1 + 8 * shape[1]) / 2 + 0.5)  # n_channels
+        diagonals = np.ones([n, m])
+        matrices = np.array([np.diag(d) for d in diagonals], dtype=np.float32)
+        cholesky_factors = self.bijector.inverse(matrices)
+        cholesky_factors += initializers.TruncatedNormal(
+            mean=0, stddev=self.std
+        ).__call__(shape=cholesky_factors.shape, dtype=tf.float32)
+        return cholesky_factors
+
+
+class NormalDiagonalInitializer(Initializer):
+    """Initializer for diagonal matrices with a normal error added.
+
+    Parameters
+    ----------
+    std : float
+        Standard deviation of the error to add.
+    """
+
+    def __init__(self, std):
+        self.std = std
+
+        # Softplus transformation to ensure diagonal is positive
+        self.bijector = tfb.Softplus()
+
+    def __call__(self, shape, dtype=None):
+        n = shape[0]  # n_modes
+        m = shape[1]  # n_channels
+        diagonals = initializers.TruncatedNormal(mean=1, stddev=self.std).__call__(
+            shape=(n, m), dtype=tf.float32
+        )
+        return self.bijector.inverse(diagonals)
 
 
 class CopyTensorInitializer(Initializer):
@@ -59,15 +161,40 @@ def reinitialize_layer_weights(layer):
     else:
         init_container = layer
 
-    # Re-initialise
-    for key, initializer in init_container.__dict__.items():
+    # Loop through the attributes of the container
+    for key in init_container.__dict__:
         if "initializer" not in key:
+            # This attribute's not an initializer
             continue
+
+        # Get the initializer object
+        initializer = init_container.__dict__[key]
+        initializer_type = type(initializer)
+
+        if initializer_type.__name__ in dir(inference.initializers):
+            # We have an osl-dynamics initializer
+            #
+            # By default these will return new random values when
+            # called, so we don't need to create a new initializer
+            new_initializer = initializer
+
+        elif isinstance(init_container.__dict__[key], Initializer):
+            # We have a standard TensorFlow initializer
+            #
+            # We need to create a new initializer to get new
+            # random values
+            new_initializer = initializer_type()
+            init_container.__dict__[key] = new_initializer
+
+        # Get the variable (i.e. weights) we want to re-initialize
         if key == "recurrent_initializer":
             var = getattr(init_container, "recurrent_kernel")
         else:
             var = getattr(init_container, key.replace("_initializer", ""))
-        var.assign(initializer(var.shape, var.dtype))
+
+        # Assign new random values to the variable
+        if var is not None:
+            var.assign(new_initializer(var.shape, var.dtype))
 
 
 def reinitialize_model_weights(model, keep=None):
@@ -88,23 +215,16 @@ def reinitialize_model_weights(model, keep=None):
         if layer.name in keep:
             continue
 
-        # If the layer consists and multiple layers pass the layer back
-        # to this function
-        if (
-            isinstance(layer, Model)
-            or isinstance(layer, inference.layers.InferenceRNNLayer)
-            or isinstance(layer, inference.layers.ModelRNNLayer)
-        ):
-            for rnn_or_model_layer in layer.layers:
-                # If the layer is bidirectional we need to re-initialise the
-                # forward and backward layers
-                if isinstance(rnn_or_model_layer, layers.Bidirectional):
-                    reinitialize_layer_weights(rnn_or_model_layer.forward_layer)
-                    reinitialize_layer_weights(rnn_or_model_layer.backward_layer)
-                # Otherwise, just re-initialise as a normal layer
-                else:
-                    reinitialize_layer_weights(rnn_or_model_layer)
-
-        # Otherwise, this is just a single layer
+        # if this is just a single layer
+        if not isinstance(layer, Model) and not ("layers" in dir(layer)):
+            # If the layer in bidirectional we need to re_initialise the
+            # forward and backward layers.
+            if isinstance(layer, layers.Bidirectional):
+                reinitialize_layer_weights(layer.forward_layer)
+                reinitialize_layer_weights(layer.backward_layer)
+            else:
+                reinitialize_layer_weights(layer)
+        # If the layer consists of multiple layers pass the layer back
+        # to this function recursively
         else:
-            reinitialize_layer_weights(layer)
+            reinitialize_model_weights(layer)

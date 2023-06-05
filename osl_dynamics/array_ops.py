@@ -54,7 +54,7 @@ def get_one_hot(values, n_states=None):
     if n_states is None:
         n_states = values.max() + 1
     res = np.eye(n_states)[np.array(values).reshape(-1)]
-    return res.reshape(list(values.shape) + [n_states])
+    return res.reshape([*list(values.shape), n_states]).astype(int)
 
 
 def align_arrays(*sequences, alignment="left"):
@@ -148,55 +148,6 @@ def cov2std(cov):
     return np.sqrt(np.diagonal(cov, axis1=-2, axis2=-1))
 
 
-def mean_diagonal(array):
-    """Set the diagonal of a matrix to the mean of all non-diagonal elements.
-
-    This is primarily useful for plotting without being concerned about the magnitude
-    of diagonal values compressing the color scale.
-
-    Parameters
-    ----------
-    array : np.ndarray
-
-    Returns
-    -------
-    mean_diagonal_array : np.ndarray
-        Array with diagonal set to mean of non-diagonal elements.
-
-    """
-    off_diagonals = ~np.eye(array.shape[0], dtype=bool)
-    new_array = array.copy()
-    np.fill_diagonal(new_array, array[off_diagonals].mean())
-    return new_array
-
-
-def trace_weights(covariance_matrices):
-    """Calculate a weight for each mode in a list of covariances, from their variance.
-
-    Parameters
-    ----------
-    covariance_matrices : np.ndarray or list of np.ndarray
-        A 3D matrix of dimensions [modes x chans x chans] ([modes x covariance]).
-
-    Returns
-    -------
-    weights : np.ndarray
-        The relative weights of each mode, from its variance.
-    """
-    covariance_matrices = np.array(covariance_matrices)
-    if covariance_matrices.ndim == 2:
-        covariance_matrices = covariance_matrices[None, ...]
-    if np.not_equal(*covariance_matrices.shape[-2:]):
-        raise ValueError(
-            "Last two dimensions of matrix must be equal. Found {} and {}".format(
-                *covariance_matrices.shape[-2:]
-            )
-        )
-    weights = np.trace(covariance_matrices, axis1=1, axis2=2)
-    normalized_weights = weights / weights.max()
-    return normalized_weights
-
-
 def sliding_window_view(x, window_shape, axis=None, *, subok=False, writeable=False):
     """Create a sliding window over an array in arbitrary dimensions.
 
@@ -281,3 +232,148 @@ def validate(
         raise ValueError(error_message)
 
     return array
+
+
+def check_symmetry(mat, precision=1e-6):
+    """Checks if one or more matrices are symmetric.
+
+    Parameters
+    ----------
+    mat : np.ndarray or list of np.ndarray
+        Matrices to be checked. Shape of a matrix should be (..., N, N).
+    precision : float
+        Precision for comparing values. Corresponds to an absolute tolerance parameter.
+        Default is 1e-6.
+
+    Returns
+    -------
+    symmetry : np.ndarray
+        Array indicating whether matrices are symmetric.
+    """
+    mat = np.array(mat)
+    if mat.ndim < 2:
+        raise ValueError("Input matrix must be an array with shape (..., N, N).")
+    transpose_axes = np.concatenate((np.arange(mat.ndim - 2), [-1, -2]))
+    symmetry = np.all(
+        np.isclose(
+            mat,
+            np.transpose(mat, axes=transpose_axes),
+            rtol=0,
+            atol=precision,
+            equal_nan=True,
+        ),
+        axis=(-1, -2),
+    )
+    return symmetry
+
+
+def ezclump(binary_array):
+    """Find the clumps (groups of data with the same values) for a 1D bool array.
+
+    Returns a series of slices.
+    Taken wholesale from numpy.ma.extras.ezclump.
+    """
+    if binary_array.ndim > 1:
+        binary_array = binary_array.ravel()
+    idx = (binary_array[1:] ^ binary_array[:-1]).nonzero()
+    idx = idx[0] + 1
+
+    if binary_array[0]:
+        if len(idx) == 0:
+            return [slice(0, binary_array.size)]
+
+        r = [slice(0, idx[0])]
+        r.extend((slice(left, right) for left, right in zip(idx[1:-1:2], idx[2::2])))
+    else:
+        if len(idx) == 0:
+            return []
+
+        r = [slice(left, right) for left, right in zip(idx[:-1:2], idx[1::2])]
+
+    if binary_array[-1]:
+        r.append(slice(idx[-1], binary_array.size))
+    return r
+
+
+def slice_length(slice_):
+    """Return the length of a slice.
+
+    Parameters
+    ----------
+    slice_ : slice
+        Slice.
+
+    Returns
+    -------
+    length : int
+    """
+    return slice_.stop - slice_.start
+
+
+def apply_to_lists(list_of_lists, func, check_empty=True):
+    """Apply a function to each list in a list of lists.
+
+    Parameters
+    ----------
+    list_of_lists : list of list
+        List of lists.
+    func : callable
+        Function to apply to each list.
+    check_empty : bool
+        Return 0 for empty lists if set as True. If False, the function
+        will be applied to an empty list.
+
+    Returns
+    -------
+    result : np.ndarray
+        Numpy array with the function applied to each list.
+    """
+    if check_empty:
+        return np.array(
+            [
+                [
+                    func(inner_list) if np.any(inner_list) else 0
+                    for inner_list in subject_list
+                ]
+                for subject_list in list_of_lists
+            ],
+        )
+
+    return np.array(
+        [
+            [func(inner_list) for inner_list in subject_list]
+            for subject_list in list_of_lists
+        ],
+    )
+
+
+def list_means(list_of_lists):
+    """Calculate the mean of each list in a list of lists.
+
+    Parameters
+    ----------
+    list_of_lists : list of list
+        List of lists.
+
+    Returns
+    -------
+    result : np.ndarray
+        Numpy array with the mean of each list.
+    """
+    return apply_to_lists(list_of_lists, func=np.mean)
+
+
+def list_stds(list_of_lists):
+    """Calculate the standard deviation of each list in a list of lists.
+
+    Parameters
+    ----------
+    list_of_lists : list of list
+        List of lists.
+
+    Returns
+    -------
+    result : np.ndarray
+        Numpy array with the standard deviation of each list.
+    """
+    return apply_to_lists(list_of_lists, func=np.std)

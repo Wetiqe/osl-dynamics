@@ -4,7 +4,7 @@
 
 print("Setting up")
 import numpy as np
-from osl_dynamics import data, files, simulation
+from osl_dynamics import data, simulation
 from osl_dynamics.inference import tf_ops
 from osl_dynamics.models.mdynemo_obs import Config, Model
 from osl_dynamics.utils import plotting
@@ -68,6 +68,3 @@ sim_fcs = sim.fcs
 plotting.plot_matrices(inf_means - sim_means, filename="means_diff.png")
 plotting.plot_matrices(inf_stds - sim_stds, filename="stds_diff.png")
 plotting.plot_matrices(inf_fcs - sim_fcs, filename="fcs_diff.png")
-
-# Delete temporary directory
-training_data.delete_dir()
